@@ -23,4 +23,20 @@ Antigravity 插件：在多步骤任务执行过程中展示过程小总结、�
 
 ## 安装方式
 
-将本目录放置于 Antigravity 插件目录（例如 `~/.gemini/config/plugins/task-hud`）并在插件管理中启用即可。运行依赖 Node.js（支持 ESM）。
+运行依赖 Node.js（支持 ESM，无需额外安装 `npm` 依赖）。
+
+### 方式一：下载 Release 压缩包（推荐）
+
+1. 前往仓库 [Releases](https://github.com/sakura-setsumi/antigravity-like-claude/releases) 页面，下载最新 `task-hud-v*.zip`；
+2. 解压得到 `task-hud` 文件夹，将其放到 Antigravity 插件目录：
+   - Windows：`C:\Users\<用户名>\.gemini\config\plugins\task-hud`
+   - macOS / Linux：`~/.gemini/config/plugins/task-hud`
+3. 在 Antigravity 插件管理中启用 **任务进度与计时 (`task-hud`)** 即可。
+
+### 方式二：通过 Git 克隆
+
+```bash
+git clone https://github.com/sakura-setsumi/antigravity-like-claude.git ~/.gemini/config/plugins/task-hud
+```
+
+后续更新只需在插件目录执行 `git pull`。
