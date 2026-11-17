@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>任务进度与计时</title>
+  <script src="/preload.js"></script>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div id="app" class="hud-shell">
+    <header class="hud-header">
+      <div class="hud-status-wrap">
+        <span id="status-dot" class="status-dot idle" aria-hidden="true"></span>
+        <div class="timer-block">
+          <div class="timer-main">
+            <span id="timer-prefix" class="timer-prefix">等待对话</span>
+            <span id="timer-value" class="timer-value">—</span>
+          </div>
+          <div id="stats-line" class="stats-line">暂无工具执行记录</div>
+        </div>
+      </div>
+
+      <div class="toggle-group" title="控制是否在主聊天流中自动注入耗时与进度提示">
+        <button id="btn-toggle-prev" class="pill-btn" type="button">
+          <span class="pill-dot"></span>
+          <span>下轮播报用时</span>
+        </button>
+        <button id="btn-toggle-mid" class="pill-btn" type="button">
+          <span class="pill-dot"></span>
+          <span>中途插播进度</span>
+        </button>
+      </div>
+    </header>
+
+    <section class="section">
+      <div id="summary-line" class="summary-line empty">
+        开始多步骤任务或提问后，这里会实时显示阶段总结与进度。
+      </div>
+
+      <div id="task-card" class="task-card">
+        <div id="task-card-header" class="task-card-header hidden">
+          <span id="task-title" class="task-title"></span>
+          <span id="task-progress-badge" class="task-progress-badge"></span>
+        </div>
+        <ul id="task-list" class="task-list"></ul>
+        <div id="task-empty" class="task-empty">
+          当前暂无多步骤任务清单；收到复杂任务时会自动同步步骤状态。
+        </div>
+      </div>
+
+      <div id="active-tool-bar" class="active-tool-bar hidden">
+        <span class="spinner" aria-hidden="true">
+          <span></span><span></span><span></span><span></span>
+        </span>
+        <span id="active-tool-label" class="active-tool-label"></span>
+        <span id="active-tool-timer" class="active-tool-timer">0s</span>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-head">
+        <span class="section-title">每轮对话计时</span>
+        <span id="turns-count" class="count-badge">0</span>
+      </div>
+      <div id="turns-list" class="turns-list"></div>
+      <div id="turns-empty" class="turns-empty">暂无已完成的轮次记录</div>
+    </section>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

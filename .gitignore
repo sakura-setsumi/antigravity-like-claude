@@ -1,0 +1,15 @@
+# Dependencies & build artifacts
+node_modules/
+dist/
+build/
+
+# Logs & temporary files
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+
+# Local plugin runtime data (if any)
+plugin_data/
+.env
+.env.*
