@@ -277,14 +277,12 @@ function extractStepLogFromHudEdit(toolCalls) {
     const content = String(args.Replacement || args.Content || '');
     const m = content.match(/<script[^>]*id=["']task-hud-(?:tasks|data)["'][^>]*>([\s\S]*?)<\/script>/i);
     const jsonText = m ? m[1] : content;
-    try {
-      const parsed = JSON.parse(jsonText.trim());
+    const { data: parsed } = parseHudTasksJsonText(jsonText);
+    if (parsed) {
       if (Array.isArray(parsed.logs) && parsed.logs.length > 0) {
         return String(parsed.logs[parsed.logs.length - 1] || '').trim();
       }
       if (parsed.summary) return String(parsed.summary).trim();
-    } catch {
-      // ignore
     }
   }
   return '';
@@ -377,44 +375,86 @@ export function buildTurnStepsFromTranscript(transcriptPath, { includeLatestTool
   }
 }
 
+function transformJsonOutsideStrings(text, transformFn) {
+  const parts = [];
+  const strRe = /"(?:\\[\s\S]|[^"\\])*"/g;
+  let lastIdx = 0;
+  for (const m of text.matchAll(strRe)) {
+    parts.push(transformFn(text.slice(lastIdx, m.index)));
+    parts.push(m[0]);
+    lastIdx = m.index + m[0].length;
+  }
+  parts.push(transformFn(text.slice(lastIdx)));
+  return parts.join('');
+}
+
+function cleanHudJsonStructureGaps(seg) {
+  return seg
+    .replace(/\]\s*\[\s*\]/g, ']')
+    .replace(/\}\s*\{\s*\}/g, '}')
+    .replace(/,\s*([}\]])/g, '$1')
+    .replace(/\}\s*\{/g, '}, {')
+    .replace(/\]\s*\[/g, '], [');
+}
+
+/**
+ * 容错解析 `#task-hud-tasks` JSON：当模型误编辑留下残余 `[]` 或尾逗号时自动在字符串外修复。
+ */
+export function parseHudTasksJsonText(rawText) {
+  const text = String(rawText || '').trim();
+  if (!text) return { data: null, repaired: false };
+
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return { data: parsed, repaired: false };
+    }
+    return { data: null, repaired: false };
+  } catch {
+    // fallback to structural repair outside string literals
+  }
+
+  try {
+    const fixed = transformJsonOutsideStrings(text, cleanHudJsonStructureGaps);
+    const parsed = JSON.parse(fixed);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return { data: parsed, repaired: true };
+    }
+  } catch {
+    // ignore unrecoverable JSON syntax error
+  }
+  return { data: null, repaired: false };
+}
+
 export function parseArtifactHudHtml(artifactDir, now = Date.now(), preferredFileName = '') {
   if (!artifactDir) return null;
   const normalizedPref = normalizeHudFileName(preferredFileName);
-  const candidates = [];
-  if (normalizedPref) {
-    candidates.push(normalizedPref);
-  } else {
+  if (!normalizedPref) return null;
+
+  const htmlPath = join(artifactDir, normalizedPref);
+  if (!existsSync(htmlPath)) return null;
+
+  try {
+    const html = readFileSync(htmlPath, 'utf-8');
+    const obj = parseHudTasksJson(html);
+    if (!obj || !Array.isArray(obj.tasks) || obj.tasks.length === 0) return null;
+    const logs = Array.isArray(obj.logs)
+      ? obj.logs.map((s) => String(s || '').trim()).filter(Boolean)
+      : obj.summary
+      ? [String(obj.summary).trim()]
+      : [];
+    const latestSummary = logs.length > 0 ? logs[logs.length - 1] : String(obj.summary || '').trim();
+    return {
+      fileName: normalizedPref,
+      taskTitle: String(obj.taskTitle || '').trim(),
+      summary: latestSummary,
+      logs,
+      status: obj.status || 'running',
+      tasks: normalizeAndAdvanceTasks(obj.tasks, { turnFinished: obj.status === 'done', now }),
+    };
+  } catch {
     return null;
   }
-
-  for (const name of candidates) {
-    const htmlPath = join(artifactDir, name);
-    if (!existsSync(htmlPath)) continue;
-    try {
-      const html = readFileSync(htmlPath, 'utf-8');
-      const m = html.match(/<script[^>]*id=["']task-hud-(?:tasks|data)["'][^>]*>([\s\S]*?)<\/script>/i);
-      if (!m || !m[1]) continue;
-      const obj = JSON.parse(m[1].trim());
-      if (!obj || !Array.isArray(obj.tasks) || obj.tasks.length === 0) continue;
-      const logs = Array.isArray(obj.logs)
-        ? obj.logs.map((s) => String(s || '').trim()).filter(Boolean)
-        : obj.summary
-        ? [String(obj.summary).trim()]
-        : [];
-      const latestSummary = logs.length > 0 ? logs[logs.length - 1] : String(obj.summary || '').trim();
-      return {
-        fileName: name,
-        taskTitle: String(obj.taskTitle || '').trim(),
-        summary: latestSummary,
-        logs,
-        status: obj.status || 'running',
-        tasks: normalizeAndAdvanceTasks(obj.tasks, { turnFinished: obj.status === 'done', now }),
-      };
-    } catch {
-      // ignore parse error
-    }
-  }
-  return null;
 }
 
 const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
@@ -441,7 +481,7 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
       width: 0 !important;
       height: 0 !important;
     }
-    .hud-wrap { padding: 2px 0 4px; }
+    .hud-wrap { padding: 2px 46px 4px 0; }
     .hud-logs {
       display: flex;
       flex-direction: column;
@@ -1055,6 +1095,8 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
               if (bc) bc.postMessage({ type: 'CLAIM', instanceId: myInstanceId, mountedAt: myMountedAt });
             } catch {}
           }
+        } else if (isDone && (Number(data.elapsedMs || 0) > 0 || Number(data.startedAt || 0) > 0)) {
+          rootEl.classList.remove('hidden');
         } else {
           rootEl.classList.add('hidden');
           return;
@@ -1114,23 +1156,53 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
         renderTimer();
       }
 
-      function parseMerged(docText) {
+      function parseHudJsonBlock(rawText, allowRepair) {
+        const text = String(rawText || '').trim();
+        if (!text) return {};
         try {
-          if (docText) {
-            const tm = docText.match(/<script[^>]*id=["']task-hud-(?:tasks|data)["'][^>]*>([\\s\\S]*?)<\\/script>/i);
-            const rm = docText.match(/<script[^>]*id=["']task-hud-runtime["'][^>]*>([\\s\\S]*?)<\\/script>/i);
-            const tObj = tm && tm[1] ? JSON.parse(tm[1]) : {};
-            const rObj = rm && rm[1] ? JSON.parse(rm[1]) : {};
-            return { ...rObj, ...tObj, status: tObj.status || rObj.status || 'running' };
-          }
-          const tRaw = ($('task-hud-tasks') || $('task-hud-data'))?.textContent || '{}';
-          const rRaw = $('task-hud-runtime')?.textContent || '{}';
-          const tObj = JSON.parse(tRaw);
-          const rObj = JSON.parse(rRaw);
-          return { ...rObj, ...tObj, status: tObj.status || rObj.status || 'running' };
+          const obj = JSON.parse(text);
+          return obj && typeof obj === 'object' && !Array.isArray(obj) ? obj : {};
         } catch {
-          return null;
+          if (!allowRepair) return {};
         }
+        try {
+          const parts = [];
+          const strRe = /"(?:\\\\[\\s\\S]|[^"\\\\])*"/g;
+          let lastIdx = 0;
+          const cleanGap = (seg) => seg
+            .replace(/\\]\\s*\\[\\s*\\]/g, ']')
+            .replace(/\\}\\s*\\{\\s*\\}/g, '}')
+            .replace(/,\\s*([}\\]])/g, '$1')
+            .replace(/\\}\\s*\\{/g, '}, {')
+            .replace(/\\]\\s*\\[/g, '], [');
+          for (const m of text.matchAll(strRe)) {
+            parts.push(cleanGap(text.slice(lastIdx, m.index)));
+            parts.push(m[0]);
+            lastIdx = m.index + m[0].length;
+          }
+          parts.push(cleanGap(text.slice(lastIdx)));
+          const obj = JSON.parse(parts.join(''));
+          return obj && typeof obj === 'object' && !Array.isArray(obj) ? obj : {};
+        } catch {
+          return {};
+        }
+      }
+
+      function parseMerged(docText) {
+        let tRaw = '';
+        let rRaw = '';
+        if (docText) {
+          const tm = docText.match(/<script[^>]*id=["']task-hud-(?:tasks|data)["'][^>]*>([\\s\\S]*?)<\\/script>/i);
+          const rm = docText.match(/<script[^>]*id=["']task-hud-runtime["'][^>]*>([\\s\\S]*?)<\\/script>/i);
+          tRaw = tm && tm[1] ? tm[1] : '{}';
+          rRaw = rm && rm[1] ? rm[1] : '{}';
+        } else {
+          tRaw = ($('task-hud-tasks') || $('task-hud-data'))?.textContent || '{}';
+          rRaw = $('task-hud-runtime')?.textContent || '{}';
+        }
+        const tObj = parseHudJsonBlock(tRaw, true);
+        const rObj = parseHudJsonBlock(rRaw, false);
+        return { ...rObj, ...tObj, status: tObj.status || rObj.status || 'running' };
       }
 
       async function pollSelf() {
@@ -1158,15 +1230,13 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
 const HUD_TASKS_SCRIPT_RE = /(<script[^>]*id=["']task-hud-(?:tasks|data)["'][^>]*>)([\s\S]*?)(<\/script>)/i;
 const HUD_RUNTIME_SCRIPT_RE = /(<script[^>]*id=["']task-hud-runtime["'][^>]*>)([\s\S]*?)(<\/script>)/i;
 const HUD_TEMPLATE_MARKER = 'freezeAsSuperseded';
+const HUD_TEMPLATE_STYLE_MARKER = 'padding: 2px 46px 4px 0';
+const HUD_TEMPLATE_RESILIENT_MARKER = 'parseHudJsonBlock';
 
 function parseHudTasksJson(html) {
   const m = String(html || '').match(HUD_TASKS_SCRIPT_RE);
   if (!m || !m[2]) return null;
-  try {
-    return JSON.parse(m[2].trim());
-  } catch {
-    return null;
-  }
+  return parseHudTasksJsonText(m[2]).data;
 }
 
 function hasNonEmptyHudTasks(html) {
@@ -1180,7 +1250,12 @@ function upgradeTemplatePreservingData(filePath) {
     return;
   }
   const origHtml = readFileSync(filePath, 'utf-8');
-  if (origHtml.includes(HUD_TEMPLATE_MARKER) && origHtml.includes('isCompletedFrozen')) {
+  if (
+    origHtml.includes(HUD_TEMPLATE_MARKER) &&
+    origHtml.includes('isCompletedFrozen') &&
+    origHtml.includes(HUD_TEMPLATE_STYLE_MARKER) &&
+    origHtml.includes(HUD_TEMPLATE_RESILIENT_MARKER)
+  ) {
     return;
   }
   let nextHtml = HUD_HTML_TEMPLATE;
@@ -1218,6 +1293,89 @@ function resolveTargetTurnSlotCount(artifactDir, minCount = 24) {
     // ignore readdir error
   }
   return Math.max(minCount, maxUsed + 8);
+}
+
+/**
+ * 为尚未主动编辑槽位文件的轮次（例如处于只读 Plan mode 的 Orchestrator）分配下一个安全空闲槽位。
+ */
+export function findNextAvailableTurnSlot(artifactDir, state = {}) {
+  let maxUsed = 0;
+  try {
+    for (const entry of readdirSync(artifactDir)) {
+      const m = entry.match(/^task-hud-t(\d+)\.html$/i);
+      if (!m) continue;
+      const idx = Number(m[1]);
+      if (!Number.isFinite(idx) || idx <= 0) continue;
+      try {
+        const html = readFileSync(join(artifactDir, entry), 'utf-8');
+        if (hasNonEmptyHudTasks(html) && idx > maxUsed) {
+          maxUsed = idx;
+        }
+      } catch {
+        // ignore
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  const stateFiles = [
+    ...(Array.isArray(state.turns) ? state.turns.map((t) => t?.hudFileName) : []),
+    state.lastCompletedTurn?.hudFileName,
+  ];
+  for (const fn of stateFiles) {
+    const m = String(fn || '').match(/^task-hud-t(\d+)\.html$/i);
+    if (m) {
+      const idx = Number(m[1]);
+      if (Number.isFinite(idx) && idx > maxUsed) maxUsed = idx;
+    }
+  }
+
+  const nextIdx = maxUsed + 1;
+  ensureArtifactHudTemplate(artifactDir, Math.max(24, nextIdx + 4));
+  return `task-hud-t${nextIdx}.html`;
+}
+
+/**
+ * 当目标槽位文件尚未填入任何任务（如只读 Plan mode 无 edit_file 工具时），自动填充默认追踪任务与首条进度说明。
+ */
+export function seedDefaultHudTasksIfEmpty(artifactDir, fileName, { userInput = '' } = {}) {
+  const norm = normalizeHudFileName(fileName);
+  if (!artifactDir || !norm) return false;
+  const htmlPath = join(artifactDir, norm);
+  upgradeTemplatePreservingData(htmlPath);
+  if (!existsSync(htmlPath)) return false;
+
+  try {
+    const origHtml = readFileSync(htmlPath, 'utf-8');
+    if (hasNonEmptyHudTasks(origHtml)) return false;
+
+    const cleanReq = String(userInput || '').replace(/\s+/g, ' ').trim();
+    const shortReq = cleanReq.length > 28 ? `${cleanReq.slice(0, 28)}…` : cleanReq;
+    const initialLog = shortReq
+      ? `已自动挂载任务进度面板，正在分析与处理请求（“${shortReq}”）。`
+      : '已自动挂载任务进度面板，正在检索上下文并分析执行方案。';
+
+    const defaultObj = {
+      taskTitle: '任务进度',
+      logs: [initialLog],
+      tasks: [
+        { id: '1', title: '检索上下文并分析处理当前任务', status: 'in_progress' },
+      ],
+    };
+
+    if (!HUD_TASKS_SCRIPT_RE.test(origHtml)) return false;
+    const nextHtml = origHtml.replace(
+      HUD_TASKS_SCRIPT_RE,
+      (_, open, _body, close) => `${open}\n${JSON.stringify(defaultObj, null, 2)}\n  ${close}`
+    );
+    if (nextHtml !== origHtml) {
+      writeFileSync(htmlPath, nextHtml, { encoding: 'utf-8' });
+    }
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export function ensureArtifactHudTemplate(artifactDir, minTurnSlots = 24) {
@@ -1312,8 +1470,8 @@ export function syncArtifactHudFile(artifactDir, state, { turnFinished = false, 
     let parsedTasks = [];
     let parsedLogs = [];
     if (m && m[2]) {
-      try {
-        const tJson = JSON.parse(m[2].trim());
+      const { data: tJson, repaired } = parseHudTasksJsonText(m[2]);
+      if (tJson) {
         if (tJson.taskTitle) state.taskTitle = String(tJson.taskTitle).trim();
         parsedLogs = Array.isArray(tJson.logs)
           ? tJson.logs.map((s) => String(s || '').trim()).filter(Boolean)
@@ -1326,24 +1484,24 @@ export function syncArtifactHudFile(artifactDir, state, { turnFinished = false, 
         } else if (tJson.summary) {
           state.summary = String(tJson.summary).trim();
         }
+        let hadUnfinished = false;
         if (Array.isArray(tJson.tasks) && tJson.tasks.length > 0) {
           parsedTasks = normalizeAndAdvanceTasks(tJson.tasks, { turnFinished, now });
           state.tasks = parsedTasks;
-          const hadUnfinished = tJson.tasks.some((t, idx) => t.status !== parsedTasks[idx]?.status);
-          if (turnFinished && hadUnfinished) {
-            const fixedObj = {
-              taskTitle: state.taskTitle || '任务进度',
-              logs: parsedLogs.length > 0 ? parsedLogs : state.summary ? [state.summary] : [],
-              tasks: parsedTasks.map((t) => ({ id: t.id, title: t.title, status: t.status })),
-            };
-            html = html.replace(
-              tasksRegex,
-              (_, open, _body, close) => `${open}\n${JSON.stringify(fixedObj, null, 2)}\n  ${close}`
-            );
-          }
+          hadUnfinished = tJson.tasks.some((t, idx) => t.status !== parsedTasks[idx]?.status);
         }
-      } catch {
-        // ignore JSON parse error
+        if (repaired || (turnFinished && hadUnfinished)) {
+          const fixedObj = {
+            taskTitle: state.taskTitle || '任务进度',
+            logs: parsedLogs.length > 0 ? parsedLogs : state.summary ? [state.summary] : [],
+            ...(tJson.status ? { status: tJson.status } : {}),
+            tasks: parsedTasks.map((t) => ({ id: t.id, title: t.title, status: t.status })),
+          };
+          html = html.replace(
+            tasksRegex,
+            (_, open, _body, close) => `${open}\n${JSON.stringify(fixedObj, null, 2)}\n  ${close}`
+          );
+        }
       }
     }
 

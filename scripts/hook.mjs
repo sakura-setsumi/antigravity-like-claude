@@ -4,6 +4,7 @@ import {
   classifyTool,
   createEmptyStats,
   ensureArtifactHudTemplate,
+  findNextAvailableTurnSlot,
   formatDuration,
   isHudInternalTool,
   loadConversationState,
@@ -18,6 +19,7 @@ import {
   resolveDataDir,
   sanitizeConversationId,
   saveConversationState,
+  seedDefaultHudTasksIfEmpty,
   summarizeToolStats,
   syncArtifactHudFile,
 } from './state-store.mjs';
@@ -43,13 +45,15 @@ function resolveCompactTranscriptPath(transcriptPath) {
 
 function inspectTranscript(transcriptPath) {
   const target = resolveCompactTranscriptPath(transcriptPath);
-  if (!target) return { latestUser: null, latestHud: null, activeHudFile: '', usedSlots: [] };
+  if (!target) return { latestUser: null, latestHud: null, activeHudFile: '', usedSlots: [], lastPlannerText: '' };
   try {
     const raw = readFileSync(target, 'utf-8');
     const lines = raw.trim().split('\n');
     let latestUser = null;
     let latestHud = null;
     let activeHudFile = '';
+    let lastPlannerText = '';
+    let sawLastPlanner = false;
     const usedSlots = [];
 
     for (let i = lines.length - 1; i >= 0; i--) {
@@ -66,6 +70,10 @@ function inspectTranscript(transcriptPath) {
 
       if (obj?.type === 'PLANNER_RESPONSE') {
         if (!latestUser) {
+          if (!sawLastPlanner) {
+            sawLastPlanner = true;
+            lastPlannerText = typeof obj?.content === 'string' ? obj.content : '';
+          }
           if (typeof obj?.content === 'string') {
             const matches = [...obj.content.matchAll(/task-hud(?:-t\d+|-\d+|-end)?\.html/gi)];
             for (let mIdx = matches.length - 1; mIdx >= 0; mIdx--) {
@@ -108,9 +116,9 @@ function inspectTranscript(transcriptPath) {
         break;
       }
     }
-    return { latestUser, latestHud, activeHudFile, usedSlots };
+    return { latestUser, latestHud, activeHudFile, usedSlots, lastPlannerText };
   } catch {
-    return { latestUser: null, latestHud: null, activeHudFile: '', usedSlots: [] };
+    return { latestUser: null, latestHud: null, activeHudFile: '', usedSlots: [], lastPlannerText: '' };
   }
 }
 
@@ -408,7 +416,43 @@ function handlePostInvocation(payload, state) {
     state.activeTurn.hudFileName = activeHudFile;
   }
 
-  const targetFileName = state.activeTurn?.hudFileName || (!isStale ? activeHudFile : '') || '';
+  let targetFileName = state.activeTurn?.hudFileName || (!isStale ? activeHudFile : '') || '';
+  let injectedOutput = null;
+
+  // 若模型处于只读 Plan mode（如 Orchestrator）无法调用 edit_file，或首轮执行业务工具时未主动写入/嵌入面板，则由 Hook 自动分配槽位并兜底注入
+  if (
+    !isStale &&
+    state.artifactDirectoryPath &&
+    state.activeTurn &&
+    !targetFileName &&
+    !state.activeTurn.autoEmbedInjected &&
+    Number(state.activeTurn.stats?.totalTools || 0) >= 1
+  ) {
+    const autoSlot = findNextAvailableTurnSlot(state.artifactDirectoryPath, state);
+    if (autoSlot) {
+      seedDefaultHudTasksIfEmpty(state.artifactDirectoryPath, autoSlot, {
+        userInput: state.activeTurn.userInput,
+      });
+      state.activeTurn.hudFileName = autoSlot;
+      state.activeTurn.autoEmbedInjected = true;
+      targetFileName = autoSlot;
+
+      const fileUri = `file:///${join(state.artifactDirectoryPath, autoSlot).replace(/\\/g, '/')}`;
+      injectedOutput = {
+        injectSteps: [
+          {
+            systemMessage: {
+              systemMessage: `任务进度面板已由 Hook 自动挂载为 ${autoSlot}。请勿再额外输出或创建重复的 <agent-embed>；若当前环境具备 edit_file 权限，后续可直接更新 ${autoSlot} 中的 #task-hud-tasks（logs 与 tasks），并在任务完成时将其全部设为 completed。`,
+              metadata: {
+                user_markdown: `<agent-embed src="${fileUri}"></agent-embed>`,
+              },
+            },
+          },
+        ],
+      };
+    }
+  }
+
   if (targetFileName) {
     applyParsedHudToState(state, latestHud, {
       turnFinished: false,
@@ -422,7 +466,7 @@ function handlePostInvocation(payload, state) {
       targetFileName,
     });
   }
-  return {};
+  return injectedOutput || {};
 }
 
 function handleStop(payload, state) {
@@ -430,7 +474,7 @@ function handleStop(payload, state) {
   if (payload.transcriptPath) state.transcriptPath = payload.transcriptPath;
   if (payload.artifactDirectoryPath) state.artifactDirectoryPath = payload.artifactDirectoryPath;
 
-  const { latestUser, latestHud, activeHudFile } = inspectTranscript(state.transcriptPath);
+  const { latestUser, latestHud, activeHudFile, lastPlannerText } = inspectTranscript(state.transcriptPath);
   const fullyDone = payload.fullyIdle !== false && (payload.terminationReason || 'NO_TOOL_CALL') === 'NO_TOOL_CALL';
 
   const isStale =
@@ -441,6 +485,40 @@ function handleStop(payload, state) {
 
   if (!isStale && state.activeTurn && !state.activeTurn.hudFileName && activeHudFile) {
     state.activeTurn.hudFileName = activeHudFile;
+  }
+
+  // 防提前中断兜底：若模型仅输出了 <agent-embed> 而未同时调用下一步业务工具，且任务尚未完成，则自动阻塞 Stop 并续跑 1 次
+  const preStopFile = state.activeTurn?.hudFileName || (!isStale ? activeHudFile : '') || '';
+  if (
+    fullyDone &&
+    !isStale &&
+    !payload.continuationActive &&
+    state.activeTurn &&
+    !state.activeTurn.stopContinuedOnce &&
+    preStopFile &&
+    typeof lastPlannerText === 'string' &&
+    /<agent-embed\b/i.test(lastPlannerText) &&
+    lastPlannerText.replace(/<agent-embed[\s\S]*?<\/agent-embed>/gi, '').trim() === ''
+  ) {
+    const preParsed = parseArtifactHudHtml(state.artifactDirectoryPath, now, preStopFile);
+    const hasUnfinished = Boolean(preParsed?.tasks?.some((t) => t.status !== 'completed'));
+    if (hasUnfinished) {
+      state.activeTurn.stopContinuedOnce = true;
+      applyParsedHudToState(state, latestHud, {
+        turnFinished: false,
+        now,
+        preferredFileName: preStopFile,
+      });
+      syncArtifactHudFile(state.artifactDirectoryPath, state, {
+        turnFinished: false,
+        now,
+        targetFileName: preStopFile,
+      });
+      return {
+        decision: 'continue',
+        reason: `你刚才仅输出了 <agent-embed> 而未同时调用业务工具，导致执行循环误判为结束。请立即调用工具继续执行 ${preStopFile} 中未完成的任务，待全部完成后再输出最终总结。`,
+      };
+    }
   }
 
   let completed = null;

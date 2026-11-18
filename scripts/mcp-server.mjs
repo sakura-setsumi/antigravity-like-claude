@@ -239,7 +239,7 @@ function handleRpcMessage(msg) {
         result: {
           protocolVersion,
           capabilities: { tools: { listChanged: false } },
-          serverInfo: { name: 'task-hud-tasks', version: '1.0.0' },
+          serverInfo: { name: 'task-hud-tasks', version: '1.1.0' },
         },
       });
     }
