@@ -1,3 +1,8 @@
 {
-  "mcpServers": {}
+  "mcpServers": {
+    "task-hud": {
+      "command": "node",
+      "args": ["./scripts/mcp-server.mjs"]
+    }
+  }
 }

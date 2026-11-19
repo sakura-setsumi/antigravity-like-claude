@@ -357,7 +357,28 @@ function extractStepLogFromHudEdit(toolCalls) {
   for (const tc of toolCalls) {
     const args = normalizeToolArgs(tc?.args);
     if (!isHudInternalTool(tc?.name, args)) continue;
+
+    // 优先支持 MCP JSON 组件接口（task_hud_init / task_hud_check / call_mcp_tool）
+    const toolNameLower = String(tc?.name || '').toLowerCase();
+    let mcpArgs = args;
+    if (toolNameLower === 'call_mcp_tool') {
+      const inner = args.Arguments ?? args.arguments;
+      if (typeof inner === 'string') {
+        try {
+          mcpArgs = normalizeToolArgs(JSON.parse(inner));
+        } catch {
+          mcpArgs = {};
+        }
+      } else if (inner && typeof inner === 'object') {
+        mcpArgs = normalizeToolArgs(inner);
+      }
+    }
+    const directLog = String(mcpArgs?.log || mcpArgs?.summary || '').trim();
+    if (directLog) return directLog;
+
+    // 兼容传统 edit_file / write_file 编辑 HTML 模板的方式
     const content = String(args.Replacement || args.Content || '');
+    if (!content) continue;
     const m = content.match(/<script[^>]*id=["']task-hud-(?:tasks|data)["'][^>]*>([\s\S]*?)<\/script>/i);
     const jsonText = m ? m[1] : content;
     const { data: parsed } = parseHudTasksJsonText(jsonText);
@@ -553,11 +574,37 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
   <meta charset="UTF-8" />
   <style>
     *, *::before, *::after { box-sizing: border-box; }
+    :root {
+      --hud-text-primary: #0b0b0b;
+      --hud-text-secondary: #52514e;
+      --hud-text-muted: #64748b;
+      --hud-ring: rgba(11, 11, 11, 0.1);
+      --hud-border: rgba(11, 11, 11, 0.12);
+      --hud-code-bg: rgba(11, 11, 11, 0.06);
+    }
+    :root[data-hud-theme="dark"] {
+      --hud-text-primary: #f0efec;
+      --hud-text-secondary: #c3c2b7;
+      --hud-text-muted: #94a3b8;
+      --hud-ring: rgba(255, 255, 255, 0.1);
+      --hud-border: rgba(255, 255, 255, 0.12);
+      --hud-code-bg: rgba(255, 255, 255, 0.085);
+    }
+    @media (prefers-color-scheme: dark) {
+      :root:not([data-hud-theme]) {
+        --hud-text-primary: #f0efec;
+        --hud-text-secondary: #c3c2b7;
+        --hud-text-muted: #94a3b8;
+        --hud-ring: rgba(255, 255, 255, 0.1);
+        --hud-border: rgba(255, 255, 255, 0.12);
+        --hud-code-bg: rgba(255, 255, 255, 0.085);
+      }
+    }
     html, body {
       margin: 0;
       padding: 0;
       background: transparent;
-      color: var(--foreground, #1e293b);
+      color: var(--hud-text-primary);
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
       font-size: 14px;
       line-height: 1.6;
@@ -589,7 +636,7 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
       gap: 5px;
       font-size: 14px;
       line-height: 1.55;
-      color: var(--muted-foreground, #64748b);
+      color: var(--hud-text-muted);
       user-select: none;
     }
     .hud-fold {
@@ -603,12 +650,12 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
       gap: 5px;
       font-size: 14px;
       line-height: 1.55;
-      color: var(--muted-foreground, #64748b);
+      color: var(--hud-text-muted);
       cursor: pointer;
       user-select: none;
     }
     .hud-fold > summary::-webkit-details-marker { display: none; }
-    .hud-fold > summary:hover { color: var(--foreground, #1e293b); }
+    .hud-fold > summary:hover { color: var(--hud-text-primary); }
     .hud-fold-chevron {
       font-size: 14px;
       opacity: 0.72;
@@ -624,7 +671,7 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
       gap: 4px;
       padding: 4px 0 2px 12px;
       margin-top: 2px;
-      border-left: 1.5px solid var(--card-border, rgba(148, 163, 184, 0.28));
+      border-left: 1.5px solid var(--hud-border);
     }
     .hud-tool-badge {
       font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
@@ -636,7 +683,7 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
       opacity: 0.72;
     }
     .hud-log-item {
-      color: var(--foreground, #1e293b);
+      color: var(--hud-text-primary);
       font-size: 14px;
       line-height: 1.65;
       word-break: break-word;
@@ -646,8 +693,8 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
       font-size: 12.5px;
       padding: 1.5px 5px;
       border-radius: 5px;
-      background: var(--secondary, rgba(148, 163, 184, 0.18));
-      color: var(--code-foreground, var(--foreground, #0f172a));
+      background: var(--hud-code-bg);
+      color: var(--hud-text-primary);
     }
     .hud-top {
       display: flex;
@@ -688,31 +735,50 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
       background: #94a3b8;
       box-shadow: 0 0 0 3px rgba(148, 163, 184, 0.18);
     }
-    .hud-muted { color: var(--muted-foreground, #64748b); }
+    .hud-muted { color: var(--hud-text-muted); }
     .hud-timer-val {
       font-weight: 600;
       font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
       font-variant-numeric: tabular-nums;
       font-size: 13px;
-      color: var(--foreground, #0f172a);
+      color: var(--hud-text-primary);
+    }
+    .hud-top-right {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      min-width: 0;
+      max-width: 100%;
     }
     .hud-stats {
-      color: var(--muted-foreground, #64748b);
+      color: var(--hud-text-muted);
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
       max-width: 100%;
     }
-    /* 任务卡片：对齐 Claude Code 任务列表（卡片 ring、14/20 排版、16px 图标盒、12px spinner） */
-    .hud-card,
-    .hud-done-summary {
-      --hud-text-primary: #0b0b0b;
-      --hud-text-secondary: #52514e;
-      --hud-text-muted: #898781;
-      --hud-ring: rgba(11, 11, 11, 0.1);
-      --hud-border: rgba(11, 11, 11, 0.1);
-      --hud-code-bg: rgba(11, 11, 11, 0.05);
+    .hud-theme-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 20px;
+      height: 20px;
+      padding: 0;
+      border: none;
+      border-radius: 5px;
+      background: transparent;
+      color: var(--hud-text-muted);
+      cursor: pointer;
+      opacity: 0.55;
+      flex-shrink: 0;
+      transition: opacity 0.15s ease, color 0.15s ease, background-color 0.15s ease;
     }
+    .hud-theme-btn:hover {
+      opacity: 1;
+      color: var(--hud-text-primary);
+      background: var(--hud-code-bg);
+    }
+    /* 任务卡片：对齐 Claude Code 任务列表（卡片 ring、14/20 排版、16px 图标盒、12px spinner） */
     .hud-card {
       display: flex;
       flex-direction: column;
@@ -727,26 +793,6 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
       font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "PingFang SC", "PingFang TC", sans-serif;
       font-size: 14px;
       line-height: 20px;
-    }
-    :root[data-hud-theme="dark"] .hud-card,
-    :root[data-hud-theme="dark"] .hud-done-summary {
-      --hud-text-primary: #f0efec;
-      --hud-text-secondary: #c3c2b7;
-      --hud-text-muted: #898781;
-      --hud-ring: rgba(255, 255, 255, 0.1);
-      --hud-border: rgba(255, 255, 255, 0.1);
-      --hud-code-bg: rgba(255, 255, 255, 0.075);
-    }
-    @media (prefers-color-scheme: dark) {
-      :root:not([data-hud-theme]) .hud-card,
-      :root:not([data-hud-theme]) .hud-done-summary {
-        --hud-text-primary: #f0efec;
-        --hud-text-secondary: #c3c2b7;
-        --hud-text-muted: #898781;
-        --hud-ring: rgba(255, 255, 255, 0.1);
-        --hud-border: rgba(255, 255, 255, 0.1);
-        --hud-code-bg: rgba(255, 255, 255, 0.075);
-      }
     }
     .hud-list {
       list-style: none;
@@ -941,7 +987,10 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
             <span id="hud-timer-label" class="hud-muted">本轮对话已用时</span>
             <span id="hud-timer-val" class="hud-timer-val">0s</span>
           </div>
-          <div id="hud-stats" class="hud-stats"></div>
+          <div class="hud-top-right">
+            <div id="hud-stats" class="hud-stats"></div>
+            <button id="hud-theme-btn" class="hud-theme-btn" type="button" aria-label="切换主题" title="切换面板明暗主题"></button>
+          </div>
         </div>
 
         <div id="hud-card" class="hud-card">
@@ -968,37 +1017,149 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
         return h > 0 ? \`\${h}h \${m}m \${s}s\` : \`\${m}m \${s}s\`;
       }
 
-      // 按宿主 --background（缺省时看 --foreground，再缺省看系统偏好）切换任务卡片的深浅色令牌
-      function syncHudTheme() {
+      const THEME_STORAGE_KEY = 'task-hud-theme-override';
+      const ICON_SUN = '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><circle cx="8" cy="8" r="3"/><path d="M8 1.8v1.4M8 12.8v1.4M1.8 8h1.4M12.8 8h1.4M3.6 3.6l1 1M11.4 11.4l1 1M12.4 3.6l-1 1M4.6 11.4l-1 1"/></svg>';
+      const ICON_MOON = '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M13.2 9.6A5.4 5.4 0 0 1 6.4 2.8a5.4 5.4 0 1 0 6.8 6.8Z"/></svg>';
+
+      function readThemeOverride() {
         try {
-          const probe = document.createElement('span');
-          probe.style.cssText = 'position:absolute;visibility:hidden;pointer-events:none';
-          document.documentElement.appendChild(probe);
-          const lumOf = (varName) => {
-            probe.style.color = 'var(' + varName + ', transparent)';
-            const c = getComputedStyle(probe).color || '';
-            const body = c.slice(c.indexOf('(') + 1).replace(/^\\s*[a-z][\\w-]*\\s+/i, '');
-            const nums = (body.match(/[\\d.]+/g) || []).map(Number);
-            if (nums.length < 3 || (nums.length >= 4 && nums[3] === 0)) return null;
-            const scale = c.startsWith('color(') ? 1 : 255;
-            const [r, g, b] = nums.slice(0, 3).map((v) => v / scale);
-            return 0.2126 * r + 0.7152 * g + 0.0722 * b;
-          };
-          const bgLum = lumOf('--background');
-          const fgLum = bgLum === null ? lumOf('--foreground') : null;
-          probe.remove();
-          const dark = bgLum !== null
-            ? bgLum < 0.5
-            : fgLum !== null
-            ? fgLum > 0.5
-            : window.matchMedia('(prefers-color-scheme: dark)').matches;
-          document.documentElement.dataset.hudTheme = dark ? 'dark' : 'light';
+          const v = localStorage.getItem(THEME_STORAGE_KEY);
+          return v === 'light' || v === 'dark' ? v : '';
+        } catch {
+          return '';
+        }
+      }
+
+      function writeThemeOverride(mode) {
+        try {
+          if (mode === 'light' || mode === 'dark') localStorage.setItem(THEME_STORAGE_KEY, mode);
+          else localStorage.removeItem(THEME_STORAGE_KEY);
         } catch {}
       }
+
+      function lumOfColorStr(c) {
+        if (!c) return null;
+        const body = c.slice(c.indexOf('(') + 1).replace(/^\\s*[a-z][\\w-]*\\s+/i, '');
+        const nums = (body.match(/[\\d.]+/g) || []).map(Number);
+        if (nums.length < 3 || (nums.length >= 4 && nums[3] === 0)) return null;
+        const scale = c.startsWith('color(') ? 1 : 255;
+        const [r, g, b] = nums.slice(0, 3).map((v) => v / scale);
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      }
+
+      function detectExplicitTheme(el) {
+        if (!el) return null;
+        for (const attr of ['data-theme', 'data-color-mode', 'data-theme-mode', 'data-vscode-theme-kind']) {
+          const v = (el.getAttribute && el.getAttribute(attr) || '').toLowerCase();
+          if (/^(light|light-theme|vs|vscode-light|hc-light)$/.test(v)) return 'light';
+          if (/^(dark|dark-theme|vs-dark|vscode-dark|hc-black|hc-dark)$/.test(v)) return 'dark';
+        }
+        if (el.classList) {
+          const isLight = ['light', 'light-theme', 'theme-light', 'vscode-light', 'vs'].some((k) => el.classList.contains(k));
+          const isDark = ['dark', 'dark-theme', 'theme-dark', 'vscode-dark', 'vs-dark', 'hc-black'].some((k) => el.classList.contains(k));
+          if (isLight !== isDark) return isLight ? 'light' : 'dark';
+        }
+        return null;
+      }
+
+      function detectParentTheme() {
+        try {
+          if (!window.parent || window.parent === window) return null;
+          const pDoc = window.parent.document;
+          if (!pDoc) return null;
+          const explicit = detectExplicitTheme(pDoc.body) || detectExplicitTheme(pDoc.documentElement);
+          if (explicit) return explicit;
+          for (const el of [pDoc.body, pDoc.documentElement]) {
+            if (!el) continue;
+            const lum = lumOfColorStr(window.parent.getComputedStyle(el).backgroundColor || '');
+            if (lum !== null) return lum < 0.5 ? 'dark' : 'light';
+          }
+        } catch {}
+        return null;
+      }
+
+      function updateThemeBtn(dark, override) {
+        const btn = $('hud-theme-btn');
+        if (!btn) return;
+        btn.innerHTML = dark ? ICON_MOON : ICON_SUN;
+        const modeLabel = override === 'light' ? '固定浅色' : override === 'dark' ? '固定深色' : '自动跟随';
+        btn.title = '面板主题：' + modeLabel + '（点击切换）';
+      }
+
+      // 按用户覆盖 > 同源父级真实背景 > 显式属性/colorScheme > 宿主 CSS 变量 > 系统偏好切换面板深浅色令牌
+      function syncHudTheme() {
+        try {
+          const override = readThemeOverride();
+          let dark = null;
+          if (override === 'light' || override === 'dark') {
+            dark = override === 'dark';
+          } else {
+            const parentTheme = detectParentTheme();
+            if (parentTheme) {
+              dark = parentTheme === 'dark';
+            } else {
+              const explicit = detectExplicitTheme(document.body) || detectExplicitTheme(document.documentElement);
+              if (explicit) {
+                dark = explicit === 'dark';
+              } else {
+                const probe = document.createElement('span');
+                probe.style.cssText = 'position:absolute;visibility:hidden;pointer-events:none';
+                document.documentElement.appendChild(probe);
+                const lumOfVar = (varName) => {
+                  probe.style.color = 'transparent';
+                  probe.style.color = 'var(' + varName + ', transparent)';
+                  let lum = lumOfColorStr(getComputedStyle(probe).color || '');
+                  if (lum === null) {
+                    probe.style.color = 'transparent';
+                    probe.style.color = 'hsl(var(' + varName + '))';
+                    lum = lumOfColorStr(getComputedStyle(probe).color || '');
+                  }
+                  return lum;
+                };
+                const bgLum = lumOfVar('--background') ?? lumOfVar('--color-background') ?? lumOfVar('--vscode-editor-background');
+                const fgLum = bgLum === null ? (lumOfVar('--foreground') ?? lumOfVar('--color-foreground')) : null;
+                probe.remove();
+                if (bgLum !== null) {
+                  dark = bgLum < 0.5;
+                } else if (fgLum !== null) {
+                  dark = fgLum > 0.5;
+                } else {
+                  const scheme = (getComputedStyle(document.documentElement).colorScheme || '').trim();
+                  if (scheme === 'light' || scheme === 'dark') dark = scheme === 'dark';
+                  else dark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+                }
+              }
+            }
+          }
+          document.documentElement.dataset.hudTheme = dark ? 'dark' : 'light';
+          updateThemeBtn(dark, override);
+        } catch {}
+      }
+
       syncHudTheme();
       try {
-        new MutationObserver(syncHudTheme).observe(document.documentElement, { attributes: true, attributeFilter: ['style', 'class'] });
+        const themeBtn = $('hud-theme-btn');
+        if (themeBtn) {
+          themeBtn.addEventListener('click', () => {
+            const curDark = document.documentElement.dataset.hudTheme === 'dark';
+            const override = readThemeOverride();
+            let next = '';
+            if (!override) next = curDark ? 'light' : 'dark';
+            else if (override === 'light') next = 'dark';
+            else next = '';
+            writeThemeOverride(next);
+            syncHudTheme();
+          });
+        }
+        const themeAttrs = ['style', 'class', 'data-theme', 'data-color-mode', 'data-theme-mode', 'data-vscode-theme-kind'];
+        const obs = new MutationObserver(syncHudTheme);
+        obs.observe(document.documentElement, { attributes: true, attributeFilter: themeAttrs });
+        if (document.body) obs.observe(document.body, { attributes: true, attributeFilter: themeAttrs });
+        if (document.head) obs.observe(document.head, { childList: true, subtree: true, attributes: true, attributeFilter: ['href', 'media', 'disabled'] });
         window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', syncHudTheme);
+        window.addEventListener('focus', syncHudTheme);
+        document.addEventListener('visibilitychange', () => { if (!document.hidden) syncHudTheme(); });
+        window.addEventListener('storage', (e) => { if (!e.key || e.key === THEME_STORAGE_KEY) syncHudTheme(); });
       } catch {}
 
       // 16×16 图标，几何与 Claude 任务列表的 CheckCircleFilled / Placeholder / DotsCircle 一致
@@ -2054,6 +2215,53 @@ function resolveCompactPath(transcriptPath) {
   return existsSync(transcriptPath) ? transcriptPath : '';
 }
 
+export function writeArtifactHudTasks(
+  artifactDir,
+  fileName,
+  { taskTitle = '任务进度', logs = [], tasks = [], autoSeeded = false } = {}
+) {
+  if (!artifactDir) return false;
+  const norm = normalizeHudFileName(fileName);
+  if (!norm) return false;
+
+  const htmlPath = join(artifactDir, norm);
+  upgradeTemplatePreservingData(htmlPath);
+  if (!existsSync(htmlPath)) return false;
+
+  try {
+    const origHtml = readFileSync(htmlPath, 'utf-8');
+    if (isHudSlotCollapsed(origHtml)) return false;
+
+    const cleanLogs = Array.isArray(logs)
+      ? logs.map((s) => String(s || '').trim()).filter(Boolean)
+      : [];
+    const cleanTasks = Array.isArray(tasks)
+      ? tasks
+          .filter((t) => t && typeof t.title === 'string' && t.title.trim())
+          .map((t, idx) => ({
+            id: String(t.id ?? idx + 1),
+            title: t.title.trim(),
+            status: t.status || 'pending',
+          }))
+      : [];
+
+    const payloadObj = {
+      taskTitle: String(taskTitle || '').trim() || '任务进度',
+      ...(autoSeeded ? { autoSeeded: true } : {}),
+      logs: cleanLogs,
+      tasks: cleanTasks,
+    };
+
+    const nextHtml = replaceTasksScriptBlock(origHtml, payloadObj);
+    if (nextHtml !== origHtml) {
+      writeTextAtomic(htmlPath, nextHtml);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * 将本轮实时计时（startedAt / elapsedMs）、工具统计、工具链 steps 与收尾对号状态直接写回对应轮次 HTML 文件的 #task-hud-runtime：
  * 严格只更新本轮显式绑定的目标槽位（targetFileName / activeTurn.hudFileName），绝不覆写历史轮次文件。
@@ -2325,7 +2533,12 @@ export function summarizeToolStats(stats) {
 
 export function isHudInternalTool(toolName, args = {}) {
   const n = String(toolName || '').toLowerCase();
-  if (n.includes('task_hud_set_tasks') || n.includes('task_hud_update_task')) {
+  if (
+    n.includes('task_hud_init') ||
+    n.includes('task_hud_check') ||
+    n.includes('task_hud_set_tasks') ||
+    n.includes('task_hud_update_task')
+  ) {
     return true;
   }
   const filePath = String(args?.Path || args?.path || args?.TargetFile || '').toLowerCase();
@@ -2336,6 +2549,8 @@ export function isHudInternalTool(toolName, args = {}) {
     const subName = String(args.ToolName || args.toolName || '').toLowerCase();
     const serverName = String(args.ServerName || args.serverName || '').toLowerCase();
     if (
+      subName.includes('task_hud_init') ||
+      subName.includes('task_hud_check') ||
       subName.includes('task_hud_set_tasks') ||
       subName.includes('task_hud_update_task') ||
       serverName.includes('task-hud')

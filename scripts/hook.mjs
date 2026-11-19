@@ -716,8 +716,12 @@ function handlePostToolUse(payload, state) {
 
   if (isHudInternalTool(toolName, normArgs)) {
     if (state.activeTurn?.hudFileName) {
+      const allCompleted =
+        Array.isArray(state.tasks) &&
+        state.tasks.length > 0 &&
+        state.tasks.every((t) => t.status === 'completed');
       syncArtifactHudFile(state.artifactDirectoryPath, state, {
-        turnFinished: false,
+        turnFinished: allCompleted,
         now,
         targetFileName: state.activeTurn.hudFileName,
       });

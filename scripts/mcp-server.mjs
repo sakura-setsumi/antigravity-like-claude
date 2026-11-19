@@ -1,9 +1,15 @@
+import { join } from 'node:path';
 import {
+  createEmptyStats,
+  findNextAvailableTurnSlot,
+  isHudSlotCollapsedFile,
   loadConversationState,
   normalizeAndAdvanceTasks,
   resolveActiveConversationId,
   resolveDataDir,
   saveConversationState,
+  syncArtifactHudFile,
+  writeArtifactHudTasks,
 } from './state-store.mjs';
 
 const VALID_STATUSES = new Set(['pending', 'in_progress', 'completed', 'failed']);
@@ -11,36 +17,41 @@ const SUPPORTED_VERSIONS = ['2025-03-26', '2024-11-05'];
 
 const TOOLS = [
   {
-    name: 'task_hud_set_tasks',
+    name: 'task_hud_init',
     description:
-      '设置或替换当前会话的任务进度清单，供右侧 Task HUD 面板实时展示。多步骤任务开始时调用一次。',
+      '初始化本轮任务进度组件：传入简洁 JSON 任务列表（支持字符串数组或 {id,title} 数组）与可选首步进展说明，后端自动分配本轮槽位并原子写入组件数据，返回可直接输出的 <agent-embed> 标签。',
     inputSchema: {
       type: 'object',
       properties: {
         title: {
           type: 'string',
-          description: '任务总标题（可选，建议简短）',
-        },
-        summary: {
-          type: 'string',
-          description: '一句简短的当前阶段说明（可选，例如：应用已关闭，正在构建新的 exe）',
+          description: '任务标题（可选，默认“任务进度”）',
         },
         tasks: {
           type: 'array',
-          description: '任务步骤列表',
+          description: '任务步骤列表，支持最简字符串数组（如 ["检查代码", "修改实现", "验证构建"]）或对象数组（{ id?, title, done?, status? }），默认自动按 1, 2, 3 编号并将第 1 项设为进行中。',
           items: {
-            type: 'object',
-            properties: {
-              id: { type: 'string', description: '可选步骤标识，缺省自动按顺序编号 1, 2...' },
-              title: { type: 'string', description: '步骤名称（建议 6-20 字）' },
-              status: {
-                type: 'string',
-                enum: ['pending', 'in_progress', 'completed', 'failed'],
-                description: '步骤状态，默认为 pending',
+            oneOf: [
+              { type: 'string' },
+              {
+                type: 'object',
+                properties: {
+                  id: { type: 'string' },
+                  title: { type: 'string' },
+                  done: { type: 'boolean' },
+                  status: {
+                    type: 'string',
+                    enum: ['pending', 'in_progress', 'completed', 'failed'],
+                  },
+                },
+                required: ['title'],
               },
-            },
-            required: ['title'],
+            ],
           },
+        },
+        log: {
+          type: 'string',
+          description: '第 1 步简短进展说明（1~2 句，关键文件名/符号/命令用反引号标出，将渲染在任务栏上方时间线中）',
         },
         conversation_id: {
           type: 'string',
@@ -51,9 +62,9 @@ const TOOLS = [
     },
   },
   {
-    name: 'task_hud_update_task',
+    name: 'task_hud_check',
     description:
-      '更新现有任务清单中的步骤状态或当前进度说明。支持单条更新（id + status）或批量更新（updates）。',
+      '更新本轮任务进度组件：完成某项任务时只需传对应 id 与 done: true（自动推进下一项为进行中）；支持仅传 log 追加上方步骤小总结、checks 批量勾选（如 {"1": true, "2": true}）或 all_done: true 一键收尾折叠。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -61,29 +72,48 @@ const TOOLS = [
           type: 'string',
           description: '要更新的任务 id、序号（如 "1"）或标题关键字',
         },
+        done: {
+          type: 'boolean',
+          description: '完成状态：true 标为 completed（默认），false 退回 pending',
+        },
+        failed: {
+          type: 'boolean',
+          description: '传 true 将对应任务标为 failed',
+        },
         status: {
           type: 'string',
           enum: ['pending', 'in_progress', 'completed', 'failed'],
-          description: '目标状态',
+          description: '可选，显式指定状态（通常只需用 done: true）',
         },
-        summary: {
-          type: 'string',
-          description: '同步更新的一句话进度说明（可选）',
-        },
-        updates: {
-          type: 'array',
-          description: '批量更新列表，每项包含 id 和 status',
-          items: {
-            type: 'object',
-            properties: {
-              id: { type: 'string' },
-              status: {
-                type: 'string',
-                enum: ['pending', 'in_progress', 'completed', 'failed'],
+        checks: {
+          description: '可选批量勾选，支持对象映射（如 {"1": true, "2": true}）或数组（[{ id, done }]）',
+          oneOf: [
+            { type: 'object', additionalProperties: { type: 'boolean' } },
+            {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  id: { type: 'string' },
+                  done: { type: 'boolean' },
+                  failed: { type: 'boolean' },
+                  status: {
+                    type: 'string',
+                    enum: ['pending', 'in_progress', 'completed', 'failed'],
+                  },
+                },
+                required: ['id'],
               },
             },
-            required: ['id', 'status'],
-          },
+          ],
+        },
+        all_done: {
+          type: 'boolean',
+          description: '传 true 一键将全部任务标为 completed 并收起面板（用于最终总结前的收尾调用）',
+        },
+        log: {
+          type: 'string',
+          description: '本步 1~2 句简练进展说明（关键项用反引号标出，将自动穿插渲染在任务栏上方）',
         },
         conversation_id: {
           type: 'string',
@@ -97,16 +127,27 @@ const TOOLS = [
 function normalizeStatus(status, fallback = 'pending') {
   const s = String(status || '').trim().toLowerCase();
   if (VALID_STATUSES.has(s)) return s;
-  if (s === 'done') return 'completed';
+  if (s === 'done' || s === 'true') return 'completed';
   if (s === 'running' || s === 'active') return 'in_progress';
+  return fallback;
+}
+
+function resolveStatusFromPatch(patch, fallback = 'completed') {
+  if (patch?.failed === true) return 'failed';
+  if (typeof patch?.status === 'string' && patch.status.trim()) {
+    return normalizeStatus(patch.status, fallback);
+  }
+  if (typeof patch?.done === 'boolean') {
+    return patch.done ? 'completed' : 'pending';
+  }
   return fallback;
 }
 
 function findTask(tasks, ref) {
   const key = String(ref ?? '').trim();
   if (!key) return null;
-  let found = tasks.find((t) => String(t.id) === key);
-  if (found) return found;
+  const exact = tasks.find((t) => String(t.id) === key);
+  if (exact) return exact;
   if (/^\d+$/.test(key)) {
     const idx = Number(key) - 1;
     if (idx >= 0 && idx < tasks.length) return tasks[idx];
@@ -116,15 +157,78 @@ function findTask(tasks, ref) {
   return matches.length === 1 ? matches[0] : null;
 }
 
-function formatTaskSummaryText(state) {
-  const counts = { completed: 0, in_progress: 0, pending: 0, failed: 0 };
-  for (const t of state.tasks) {
-    counts[t.status] = (counts[t.status] || 0) + 1;
+function ensureActiveTurnAndSlot(state, now) {
+  if (!state.activeTurn) {
+    const nextIndex = (state.turns?.[state.turns.length - 1]?.turnIndex || 0) + 1;
+    state.activeTurn = {
+      turnIndex: nextIndex,
+      userStepIndex: null,
+      minUserStepIndex: null,
+      userInput: '',
+      userFingerprint: '',
+      payloadFingerprint: '',
+      hudFileName: '',
+      hasUserEmbed: false,
+      autoEmbedInjected: false,
+      autoSeededSlot: '',
+      supersededCollapsed: false,
+      startedAt: now,
+      invocationCount: 1,
+      stats: createEmptyStats(),
+      recentTools: [],
+      lastAnnouncedToolCount: 0,
+    };
   }
-  return `任务清单已同步（共 ${state.tasks.length} 项：完成 ${counts.completed}、进行中 ${counts.in_progress}、待处理 ${counts.pending}${counts.failed ? `、失败 ${counts.failed}` : ''}）。`;
+
+  let hudFile = state.activeTurn.hudFileName || '';
+  if (
+    hudFile &&
+    state.artifactDirectoryPath &&
+    isHudSlotCollapsedFile(state.artifactDirectoryPath, hudFile)
+  ) {
+    hudFile = '';
+  }
+  if (!hudFile && state.artifactDirectoryPath) {
+    hudFile = findNextAvailableTurnSlot(state.artifactDirectoryPath, state);
+  }
+  if (hudFile) {
+    state.activeTurn.hudFileName = hudFile;
+    state.activeTurn.autoSeededSlot = '';
+  }
+  return hudFile;
 }
 
-function handleSetTasks(args) {
+function formatProgressText(state) {
+  const tasks = Array.isArray(state.tasks) ? state.tasks : [];
+  const doneCount = tasks.filter((t) => t.status === 'completed').length;
+  const active = tasks.find((t) => t.status === 'in_progress');
+  const failedCount = tasks.filter((t) => t.status === 'failed').length;
+  if (tasks.length === 0) return '当前尚无任务。';
+  if (doneCount === tasks.length) {
+    return `全部 ${tasks.length} 项任务已完成，面板已收起。`;
+  }
+  const parts = [`进度 ${doneCount}/${tasks.length}`];
+  if (active) parts.push(`当前进行中：#${active.id} ${active.title}`);
+  if (failedCount > 0) parts.push(`失败 ${failedCount} 项`);
+  return parts.join(' · ');
+}
+
+function syncHudToDisk(state, hudFile, { turnFinished = false, now = Date.now() } = {}) {
+  if (!state.artifactDirectoryPath || !hudFile) return;
+  writeArtifactHudTasks(state.artifactDirectoryPath, hudFile, {
+    taskTitle: state.taskTitle || '任务进度',
+    logs: Array.isArray(state.logs) ? state.logs : [],
+    tasks: Array.isArray(state.tasks) ? state.tasks : [],
+    autoSeeded: false,
+  });
+  syncArtifactHudFile(state.artifactDirectoryPath, state, {
+    turnFinished,
+    now,
+    targetFileName: hudFile,
+  });
+}
+
+function handleInitTasks(args) {
   const dataDir = resolveDataDir();
   const convId = resolveActiveConversationId(args?.conversation_id, dataDir);
   if (!convId) {
@@ -135,35 +239,83 @@ function handleSetTasks(args) {
   }
 
   const rawTasks = Array.isArray(args?.tasks) ? args.tasks : [];
+  if (rawTasks.length === 0) {
+    return {
+      isError: true,
+      content: [{ type: 'text', text: 'tasks 不能为空，请至少传入 1 项任务。' }],
+    };
+  }
+
   const now = Date.now();
   const state = loadConversationState(convId, dataDir);
+  const hudFile = ensureActiveTurnAndSlot(state, now);
 
-  if (typeof args?.title === 'string') {
-    state.taskTitle = args.title.trim();
+  state.taskTitle = typeof args?.title === 'string' && args.title.trim() ? args.title.trim() : '任务进度';
+  const initLog = String(args?.log ?? args?.summary ?? '').trim();
+  state.logs = initLog ? [initLog] : [];
+  state.summary = initLog;
+
+  const parsed = rawTasks
+    .map((item, idx) => {
+      if (typeof item === 'string') {
+        const title = item.trim();
+        return title ? { id: String(idx + 1), title, status: 'pending', updatedAt: now } : null;
+      }
+      if (item && typeof item === 'object' && typeof item.title === 'string' && item.title.trim()) {
+        const status =
+          item.done === true
+            ? 'completed'
+            : item.status
+            ? normalizeStatus(item.status, 'pending')
+            : 'pending';
+        return {
+          id: String(item.id ?? idx + 1),
+          title: item.title.trim(),
+          status,
+          updatedAt: now,
+        };
+      }
+      return null;
+    })
+    .filter(Boolean);
+
+  if (parsed.length === 0) {
+    return {
+      isError: true,
+      content: [{ type: 'text', text: 'tasks 中没有有效的任务标题。' }],
+    };
   }
-  if (typeof args?.summary === 'string') {
-    state.summary = args.summary.trim();
+
+  if (!parsed.some((t) => t.status === 'in_progress') && parsed.some((t) => t.status === 'pending')) {
+    const firstPending = parsed.find((t) => t.status === 'pending');
+    if (firstPending) firstPending.status = 'in_progress';
   }
 
-  state.tasks = normalizeAndAdvanceTasks(
-    rawTasks
-      .filter((item) => item && typeof item.title === 'string' && item.title.trim())
-      .map((item, idx) => ({
-        id: String(item.id ?? idx + 1),
-        title: item.title.trim(),
-        status: normalizeStatus(item.status, 'pending'),
-        updatedAt: now,
-      })),
-    { now },
-  );
+  state.tasks = normalizeAndAdvanceTasks(parsed, { now });
+  const allCompleted = state.tasks.length > 0 && state.tasks.every((t) => t.status === 'completed');
 
+  syncHudToDisk(state, hudFile, { turnFinished: allCompleted, now });
   saveConversationState(state, dataDir);
+
+  const idMap = state.tasks.map((t) => `${t.id}: ${t.title}`).join('；');
+  if (state.artifactDirectoryPath && hudFile) {
+    const fileUri = `file:///${join(state.artifactDirectoryPath, hudFile).replace(/\\/g, '/')}`;
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `任务组件已就绪（${formatProgressText(state)}）。任务编号：${idMap}\n请在下一步回复中原样输出以下唯一标签（标签外不写过程文字）并同时发起业务工具调用：\n<agent-embed src="${fileUri}"></agent-embed>`,
+        },
+      ],
+    };
+  }
+
   return {
-    content: [{ type: 'text', text: formatTaskSummaryText(state) }],
+    content: [{ type: 'text', text: `任务清单已同步（${formatProgressText(state)}）。任务编号：${idMap}` }],
   };
 }
 
-function handleUpdateTask(args) {
+function handleCheckTask(args) {
   const dataDir = resolveDataDir();
   const convId = resolveActiveConversationId(args?.conversation_id, dataDir);
   if (!convId) {
@@ -175,42 +327,89 @@ function handleUpdateTask(args) {
 
   const state = loadConversationState(convId, dataDir);
   const now = Date.now();
+  const hudFile = ensureActiveTurnAndSlot(state, now);
 
-  if (typeof args?.summary === 'string') {
-    state.summary = args.summary.trim();
+  const stepLog = String(args?.log ?? args?.summary ?? '').trim();
+  if (stepLog) {
+    if (!Array.isArray(state.logs)) state.logs = [];
+    if (state.logs[state.logs.length - 1] !== stepLog) {
+      state.logs.push(stepLog);
+    }
+    state.summary = stepLog;
   }
 
-  const patchList = [];
-  if (Array.isArray(args?.updates)) {
-    for (const u of args.updates) {
-      if (u && u.id !== undefined && u.status !== undefined) {
-        patchList.push({ id: u.id, status: u.status });
+  if (!Array.isArray(state.tasks)) state.tasks = [];
+
+  let updatedCount = 0;
+
+  if (args?.all_done === true) {
+    for (const t of state.tasks) {
+      if (t.status !== 'completed' && t.status !== 'failed') {
+        t.status = 'completed';
+        t.updatedAt = now;
+        updatedCount++;
       }
     }
   }
-  if (args?.id !== undefined && args?.status !== undefined) {
-    patchList.push({ id: args.id, status: args.status });
+
+  const patchList = [];
+  if (Array.isArray(args?.checks)) {
+    for (const item of args.checks) {
+      if (item && item.id !== undefined) {
+        patchList.push({ id: item.id, status: resolveStatusFromPatch(item, 'completed') });
+      }
+    }
+  } else if (args?.checks && typeof args.checks === 'object') {
+    for (const [k, v] of Object.entries(args.checks)) {
+      if (typeof v === 'boolean') {
+        patchList.push({ id: k, status: v ? 'completed' : 'pending' });
+      } else if (typeof v === 'string') {
+        patchList.push({ id: k, status: normalizeStatus(v, 'completed') });
+      }
+    }
   }
 
-  let updatedCount = 0;
+  if (Array.isArray(args?.updates)) {
+    for (const u of args.updates) {
+      if (u && u.id !== undefined) {
+        patchList.push({ id: u.id, status: resolveStatusFromPatch(u, 'completed') });
+      }
+    }
+  }
+
+  if (args?.id !== undefined) {
+    patchList.push({ id: args.id, status: resolveStatusFromPatch(args, 'completed') });
+  }
+
   for (const patch of patchList) {
     const task = findTask(state.tasks, patch.id);
     if (task) {
-      task.status = normalizeStatus(patch.status, task.status);
+      task.status = patch.status;
       task.updatedAt = now;
       updatedCount++;
     }
   }
 
-  state.tasks = normalizeAndAdvanceTasks(state.tasks, { now });
+  const allCompleted = state.tasks.length > 0 && state.tasks.every((t) => t.status === 'completed');
+  if (
+    !allCompleted &&
+    !state.tasks.some((t) => t.status === 'in_progress') &&
+    state.tasks.some((t) => t.status === 'pending')
+  ) {
+    const nextPending = state.tasks.find((t) => t.status === 'pending');
+    if (nextPending) {
+      nextPending.status = 'in_progress';
+      nextPending.updatedAt = now;
+    }
+  }
+  state.tasks = normalizeAndAdvanceTasks(state.tasks, { turnFinished: allCompleted, now });
+
+  syncHudToDisk(state, hudFile, { turnFinished: allCompleted, now });
   saveConversationState(state, dataDir);
+
+  const prefix = updatedCount > 0 ? `已更新 ${updatedCount} 项任务。` : stepLog ? '已追加步骤进展。' : '';
   return {
-    content: [
-      {
-        type: 'text',
-        text: `${updatedCount > 0 ? `已更新 ${updatedCount} 项任务。` : ''}${formatTaskSummaryText(state)}`,
-      },
-    ],
+    content: [{ type: 'text', text: `${prefix}${formatProgressText(state)}` }],
   };
 }
 
@@ -239,7 +438,7 @@ function handleRpcMessage(msg) {
         result: {
           protocolVersion,
           capabilities: { tools: { listChanged: false } },
-          serverInfo: { name: 'task-hud-tasks', version: '1.2.0' },
+          serverInfo: { name: 'task-hud-tasks', version: '1.3.0' },
         },
       });
     }
@@ -260,10 +459,10 @@ function handleRpcMessage(msg) {
     const name = params?.name;
     const args = params?.arguments || {};
     let result;
-    if (name === 'task_hud_set_tasks') {
-      result = handleSetTasks(args);
-    } else if (name === 'task_hud_update_task') {
-      result = handleUpdateTask(args);
+    if (name === 'task_hud_init' || name === 'task_hud_set_tasks') {
+      result = handleInitTasks(args);
+    } else if (name === 'task_hud_check' || name === 'task_hud_update_task') {
+      result = handleCheckTask(args);
     } else {
       result = {
         isError: true,
