@@ -7,6 +7,7 @@ import {
   classifyTool,
   createEmptyStats,
   isHudInternalTool,
+  isTurnInterrupted,
   loadConversationState,
   loadSettings,
   normalizeAndAdvanceTasks,
@@ -18,6 +19,7 @@ import {
   sanitizeConversationId,
   saveSettings,
 } from '../../scripts/state-store.mjs';
+import { createCancelWatcher } from '../../scripts/cancel-watcher.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -307,8 +309,20 @@ function mergeHudSnapshot(convId, dataDir) {
 
   let activeTurn = state.activeTurn ? { ...state.activeTurn } : null;
   const latestTranscriptTurn = transcriptTurns[transcriptTurns.length - 1];
+  const latestAlreadySettled = Boolean(
+    latestTranscriptTurn &&
+      numberedTurns.some(
+        (t) =>
+          (t.userStepIndex !== null &&
+            t.userStepIndex !== undefined &&
+            t.userStepIndex === latestTranscriptTurn.userStepIndex) ||
+          (t.startedAt &&
+            latestTranscriptTurn.startedAt &&
+            Math.abs(t.startedAt - latestTranscriptTurn.startedAt) < 15000)
+      )
+  );
 
-  if (!activeTurn && latestTranscriptTurn && !latestTranscriptTurn.isFinished && latestTranscriptTurn.startedAt) {
+  if (!activeTurn && !latestAlreadySettled && latestTranscriptTurn && !latestTranscriptTurn.isFinished && latestTranscriptTurn.startedAt) {
     const ageMs = now - (latestTranscriptTurn.lastStepAt || latestTranscriptTurn.startedAt);
     if (ageMs < 15 * 60 * 1000) {
       activeTurn = {
@@ -332,7 +346,13 @@ function mergeHudSnapshot(convId, dataDir) {
   }
 
   const lastCompletedTurn = numberedTurns.length > 0 ? numberedTurns[numberedTurns.length - 1] : null;
-  const status = activeTurn ? 'running' : lastCompletedTurn ? 'done' : 'idle';
+  const status = activeTurn
+    ? 'running'
+    : lastCompletedTurn
+    ? isTurnInterrupted(lastCompletedTurn)
+      ? 'interrupted'
+      : 'done'
+    : 'idle';
 
   const artifactDir =
     state.artifactDirectoryPath ||
@@ -348,7 +368,7 @@ function mergeHudSnapshot(convId, dataDir) {
     Array.isArray(hudFromTranscript?.tasks) && hudFromTranscript.tasks.length > 0
       ? hudFromTranscript.tasks
       : state.tasks || [];
-  const tasks = normalizeAndAdvanceTasks(rawTasks, { turnFinished: status !== 'running', now });
+  const tasks = normalizeAndAdvanceTasks(rawTasks, { turnFinished: status === 'done', now });
   const taskTitle = hudFromTranscript?.taskTitle || state.taskTitle || '';
   const summary =
     hudFromTranscript?.summary ||
@@ -462,4 +482,11 @@ app.api(
   'POST',
 );
 
-app.run();
+const cancelWatcher = createCancelWatcher({
+  dataDir: resolveDataDir(),
+  logger: (msg) => console.error(msg),
+});
+
+app.run().then(() => {
+  cancelWatcher.start();
+});

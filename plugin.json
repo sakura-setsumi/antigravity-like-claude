@@ -2,7 +2,7 @@
   "name": "task-hud",
   "displayName": "任务进度与计时",
   "description": "在对话过程输出简短进展旁白，并在右侧辅助面板实时追踪任务列表状态、工具耗时与每轮对话用时。",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
     "帮我拆解并执行一个多步骤改造任务，实时同步任务清单与用时",

@@ -102,10 +102,16 @@
       const s = summarizeStats(snap.activeTurn.stats);
       statsLine.textContent = s || '正在分析并准备执行步骤…';
     } else if (snap.lastCompletedTurn) {
-      prefix.textContent = `第 ${snap.lastCompletedTurn.turnIndex || 1} 轮 · 用时`;
+      const turnNo = snap.lastCompletedTurn.turnIndex || 1;
+      if (snap.status === 'interrupted') {
+        const isUserCanceled = snap.lastCompletedTurn.terminationReason === 'USER_CANCELED';
+        prefix.textContent = isUserCanceled ? `第 ${turnNo} 轮已停止 · 用时` : `第 ${turnNo} 轮已中断 · 用时`;
+      } else {
+        prefix.textContent = `第 ${turnNo} 轮 · 用时`;
+      }
       value.textContent = formatDuration(snap.lastCompletedTurn.elapsedMs);
       const s = summarizeStats(snap.lastCompletedTurn.stats);
-      statsLine.textContent = s || '本轮直接回答，未调用外部工具';
+      statsLine.textContent = s || (snap.status === 'interrupted' ? '本轮已中止' : '本轮直接回答，未调用外部工具');
     } else {
       prefix.textContent = '等待对话';
       value.textContent = '—';

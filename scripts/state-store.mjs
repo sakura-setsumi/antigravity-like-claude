@@ -76,6 +76,23 @@ export function writeJsonAtomic(filePath, data) {
   }
 }
 
+export function writeTextAtomic(filePath, content) {
+  ensureDir(dirname(filePath));
+  const tmp = `${filePath}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
+  try {
+    writeFileSync(tmp, content, { encoding: 'utf-8' });
+    renameSync(tmp, filePath);
+  } catch {
+    writeFileSync(filePath, content, { encoding: 'utf-8' });
+  } finally {
+    try {
+      if (existsSync(tmp)) rmSync(tmp, { force: true });
+    } catch {
+      // ignore cleanup errors
+    }
+  }
+}
+
 export function settingsPath(dataDir = resolveDataDir()) {
   return join(dataDir, 'settings.json');
 }
@@ -141,6 +158,64 @@ export function createEmptyConversationState(conversationId) {
     lastCompletedTurn: null,
     turns: [],
   };
+}
+
+export function isTurnInterrupted(turn) {
+  return Boolean(turn && (turn.interrupted || (turn.terminationReason && turn.terminationReason !== 'NO_TOOL_CALL')));
+}
+
+export function finalizeActiveTurn(state, { terminationReason = 'NO_TOOL_CALL', now = Date.now() } = {}) {
+  if (!state.activeTurn) return null;
+  const t = state.activeTurn;
+  const startedAtNum = Number(t.startedAt) || now;
+  const endedAt = Math.max(now, startedAtNum);
+  const completed = {
+    turnIndex: t.turnIndex,
+    userStepIndex: t.userStepIndex ?? null,
+    userInput: t.userInput || '',
+    userFingerprint: t.userFingerprint || '',
+    payloadFingerprint: t.payloadFingerprint || '',
+    hudFileName: t.hudFileName || '',
+    hasUserEmbed: Boolean(t.hasUserEmbed),
+    autoEmbedInjected: Boolean(t.autoEmbedInjected),
+    autoSeededSlot: t.autoSeededSlot || '',
+    hudCollapsed: Boolean(t.hudCollapsed || t.supersededCollapsed),
+    interrupted: terminationReason !== 'NO_TOOL_CALL',
+    startedAt: startedAtNum,
+    endedAt,
+    elapsedMs: Math.max(0, endedAt - startedAtNum),
+    terminationReason,
+    stats: t.stats || createEmptyStats(),
+    announcedInChat: false,
+  };
+
+  const lastIdx = state.turns.length - 1;
+  if (
+    lastIdx >= 0 &&
+    completed.userStepIndex !== null &&
+    state.turns[lastIdx].userStepIndex === completed.userStepIndex
+  ) {
+    const prev = state.turns[lastIdx];
+    const startedAt = Math.min(prev.startedAt || completed.startedAt, completed.startedAt);
+    completed.turnIndex = prev.turnIndex;
+    completed.hudFileName = completed.hudFileName || prev.hudFileName || '';
+    completed.hudCollapsed = Boolean(completed.hudCollapsed || prev.hudCollapsed);
+    completed.interrupted = Boolean(completed.interrupted);
+    completed.userFingerprint = completed.userFingerprint || prev.userFingerprint || '';
+    completed.payloadFingerprint = completed.payloadFingerprint || prev.payloadFingerprint || '';
+    completed.startedAt = startedAt;
+    completed.elapsedMs = Math.max(0, endedAt - startedAt);
+    state.turns[lastIdx] = completed;
+  } else {
+    state.turns.push(completed);
+    if (state.turns.length > 50) {
+      state.turns = state.turns.slice(-50);
+    }
+  }
+
+  state.lastCompletedTurn = completed;
+  state.activeTurn = null;
+  return completed;
 }
 
 export function normalizeAndAdvanceTasks(tasks, { turnFinished = false, now = Date.now() } = {}) {
@@ -228,7 +303,8 @@ function formatToolChainItem(toolName, rawArgs) {
 
   if (name === 'run_command') {
     const summary = String(args.toolSummary || args.CommandLine || '').replace(/\s+/g, ' ').trim();
-    const cmd = String(args.CommandLine || '').trim();
+    const rawCmd = String(args.CommandLine || '').trim();
+    const cmd = rawCmd.length > 240 ? `${rawCmd.slice(0, 240)}…` : rawCmd;
     return {
       kind: 'command',
       text: summary ? `Ran ${summary}` : 'Ran command',
@@ -260,6 +336,13 @@ function formatToolChainItem(toolName, rawArgs) {
       kind: 'search',
       text: q ? `Searched ${q}` : 'Explored files',
       detail: q,
+    };
+  }
+  if (name === 'exit_plan_mode') {
+    return {
+      kind: 'other',
+      text: '完成规划并移交执行',
+      detail: '',
     };
   }
   return {
@@ -337,7 +420,8 @@ export function buildTurnStepsFromTranscript(transcriptPath, { includeLatestTool
           .replace(/<agent-embed[^>]*><\/agent-embed>/gi, '')
           .trim();
         const hudLog = extractStepLogFromHudEdit(obj.tool_calls);
-        let logText = hudLog || cleanContent;
+        const hasToolCalls = Array.isArray(obj.tool_calls) && obj.tool_calls.length > 0;
+        let logText = hudLog || (hasToolCalls ? cleanContent : '');
 
         // Deduplicate identical consecutive log lines
         const prevLog = plannerSteps.length > 0 ? plannerSteps[plannerSteps.length - 1].log : '';
@@ -438,6 +522,12 @@ export function parseArtifactHudHtml(artifactDir, now = Date.now(), preferredFil
     const html = readFileSync(htmlPath, 'utf-8');
     const obj = parseHudTasksJson(html);
     if (!obj || !Array.isArray(obj.tasks) || obj.tasks.length === 0) return null;
+    const runtimeObj = parseHudRuntimeJson(html);
+    const runtimeStatus = typeof runtimeObj?.status === 'string' ? runtimeObj.status : '';
+    const status =
+      runtimeStatus === 'collapsed' || runtimeStatus === 'interrupted' || runtimeStatus === 'done'
+        ? runtimeStatus
+        : obj.status || runtimeStatus || 'running';
     const logs = Array.isArray(obj.logs)
       ? obj.logs.map((s) => String(s || '').trim()).filter(Boolean)
       : obj.summary
@@ -449,8 +539,8 @@ export function parseArtifactHudHtml(artifactDir, now = Date.now(), preferredFil
       taskTitle: String(obj.taskTitle || '').trim(),
       summary: latestSummary,
       logs,
-      status: obj.status || 'running',
-      tasks: normalizeAndAdvanceTasks(obj.tasks, { turnFinished: obj.status === 'done', now }),
+      status,
+      tasks: normalizeAndAdvanceTasks(obj.tasks, { turnFinished: status === 'done', now }),
     };
   } catch {
     return null;
@@ -613,13 +703,50 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
       text-overflow: ellipsis;
       max-width: 100%;
     }
+    /* 任务卡片：对齐 Claude Code 任务列表（卡片 ring、14/20 排版、16px 图标盒、12px spinner） */
+    .hud-card,
+    .hud-done-summary {
+      --hud-text-primary: #0b0b0b;
+      --hud-text-secondary: #52514e;
+      --hud-text-muted: #898781;
+      --hud-ring: rgba(11, 11, 11, 0.1);
+      --hud-border: rgba(11, 11, 11, 0.1);
+      --hud-code-bg: rgba(11, 11, 11, 0.05);
+    }
     .hud-card {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      padding: 16px;
       border-radius: 12px;
-      border: 1px solid var(--card-border, rgba(148, 163, 184, 0.28));
-      background: var(--card, rgba(255, 255, 255, 0.78));
-      padding: 12px 14px;
-      font-size: 12.5px;
-      line-height: 1.5;
+      background: transparent;
+      box-shadow: inset 0 0 0 1px var(--hud-ring);
+      overflow: clip;
+      overflow-wrap: break-word;
+      color: var(--hud-text-primary);
+      font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "PingFang SC", "PingFang TC", sans-serif;
+      font-size: 14px;
+      line-height: 20px;
+    }
+    :root[data-hud-theme="dark"] .hud-card,
+    :root[data-hud-theme="dark"] .hud-done-summary {
+      --hud-text-primary: #f0efec;
+      --hud-text-secondary: #c3c2b7;
+      --hud-text-muted: #898781;
+      --hud-ring: rgba(255, 255, 255, 0.1);
+      --hud-border: rgba(255, 255, 255, 0.1);
+      --hud-code-bg: rgba(255, 255, 255, 0.075);
+    }
+    @media (prefers-color-scheme: dark) {
+      :root:not([data-hud-theme]) .hud-card,
+      :root:not([data-hud-theme]) .hud-done-summary {
+        --hud-text-primary: #f0efec;
+        --hud-text-secondary: #c3c2b7;
+        --hud-text-muted: #898781;
+        --hud-ring: rgba(255, 255, 255, 0.1);
+        --hud-border: rgba(255, 255, 255, 0.1);
+        --hud-code-bg: rgba(255, 255, 255, 0.075);
+      }
     }
     .hud-list {
       list-style: none;
@@ -627,23 +754,81 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
       padding: 0;
       display: flex;
       flex-direction: column;
-      gap: 6px;
+      gap: 8px;
+      -webkit-user-select: text;
+      user-select: text;
     }
     .hud-item {
       display: flex;
-      align-items: center;
-      gap: 8px;
-      line-height: 1.4;
+      align-items: flex-start;
+      gap: 4px;
+      color: var(--hud-text-primary);
     }
+    .hud-item.is-done { color: var(--hud-text-secondary); }
     .hud-item-icon {
-      display: inline-flex;
+      display: flex;
       align-items: center;
       justify-content: center;
       flex-shrink: 0;
-      color: var(--muted-foreground, #64748b);
+      width: 16px;
+      height: 20px;
+      color: var(--hud-text-primary);
     }
-    .hud-item-done { color: var(--muted-foreground, #64748b); }
-    .hud-item-active { color: var(--foreground, #0f172a); }
+    .hud-item.is-done .hud-item-icon,
+    .hud-item.is-pending .hud-item-icon { color: var(--hud-text-secondary); }
+    .hud-item-icon > svg { flex: none; width: 16px; height: 16px; }
+    .hud-item-icon > .hud-icon-paused { display: none; }
+    .hud-card.is-paused .hud-spinner { display: none; }
+    .hud-card.is-paused .hud-item-icon > .hud-icon-paused { display: block; }
+    .hud-item-text {
+      min-width: 0;
+      flex: 1 1 0%;
+      text-align: start;
+      overflow-wrap: break-word;
+    }
+    .hud-item-code {
+      font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+      font-size: 0.9em;
+      line-height: 1;
+      padding: 1px 4px;
+      border-radius: 4px;
+      background: var(--hud-code-bg);
+      color: color-mix(in oklab, currentColor, var(--hud-text-primary));
+    }
+    .hud-spinner {
+      position: relative;
+      display: inline-block;
+      flex-shrink: 0;
+      vertical-align: middle;
+      width: 12px;
+      height: 12px;
+    }
+    .hud-spinner > span {
+      position: absolute;
+      inset: 0;
+      border-radius: 9999px;
+    }
+    .hud-spinner-track { border: 1.5px solid var(--hud-border); }
+    .hud-spinner-arc {
+      /* task-hud-spinner-v3 */
+      background: conic-gradient(transparent 25%, var(--hud-text-secondary));
+      -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 1.5px), #000 calc(100% - 1.5px + 0.5px));
+      mask: radial-gradient(farthest-side, transparent calc(100% - 1.5px), #000 calc(100% - 1.5px + 0.5px));
+      animation: hud-spin 1.1s linear infinite;
+      will-change: transform;
+    }
+    @keyframes hud-spin {
+      from { transform: rotate(0deg); }
+      to { transform: rotate(360deg); }
+    }
+    .hud-list-note {
+      margin: 0;
+      padding-inline-start: 24px;
+      font-size: 12px;
+      line-height: 17px;
+      color: var(--hud-text-secondary);
+    }
+    /* 完成/中断折叠条：沿用任务卡片（ring、12px 圆角、16px 内边距、14/20、16px 图标盒、CaretRight 展开箭头） */
     .hud-done-fold {
       margin: 0;
       padding: 0;
@@ -651,41 +836,69 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
     .hud-done-summary {
       list-style: none;
       display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 10px;
-      padding: 6px 10px;
-      border-radius: 9px;
-      border: 1px solid var(--card-border, rgba(148, 163, 184, 0.24));
-      background: var(--card, rgba(255, 255, 255, 0.55));
-      font-size: 12.5px;
-      line-height: 1.4;
-      color: var(--muted-foreground, #64748b);
+      align-items: flex-start;
+      gap: 4px;
+      padding: 16px;
+      border-radius: 12px;
+      background: transparent;
+      box-shadow: inset 0 0 0 1px var(--hud-ring);
+      overflow-wrap: break-word;
+      color: var(--hud-text-secondary);
+      font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "PingFang SC", "PingFang TC", sans-serif;
+      font-size: 14px;
+      line-height: 20px;
       cursor: pointer;
+      -webkit-user-select: none;
       user-select: none;
     }
     .hud-done-summary::-webkit-details-marker { display: none; }
-    .hud-done-summary:hover { color: var(--foreground, #1e293b); }
-    .hud-done-left {
-      display: inline-flex;
+    .hud-done-summary:hover { color: var(--hud-text-primary); }
+    .hud-done-icon,
+    .hud-done-chevron {
+      display: flex;
       align-items: center;
-      gap: 7px;
-      min-width: 0;
-    }
-    .hud-done-right {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
+      justify-content: center;
       flex-shrink: 0;
-      font-size: 12px;
+      width: 16px;
+      height: 20px;
     }
-    .hud-done-fold[open] > .hud-done-summary .hud-fold-chevron {
-      transform: rotate(90deg);
+    .hud-done-icon > svg,
+    .hud-done-chevron > svg { flex: none; width: 16px; height: 16px; }
+    .hud-done-text { min-width: 0; flex: 1 1 auto; }
+    /* 窄宽度时统计信息优先收缩，保证主文案完整 */
+    .hud-done-stats {
+      flex: 0 1000 auto;
+      min-width: 0;
+      max-width: 45%;
+      margin-inline-start: 8px;
+      font-size: 12px;
+      line-height: 20px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .hud-done-stats:empty { display: none; }
+    .hud-done-chevron > svg { transition: transform 0.2s cubic-bezier(0, 0, 0.2, 1); }
+    .hud-done-fold[open] > .hud-done-summary .hud-done-chevron > svg { transform: rotate(90deg); }
+    @media (prefers-reduced-motion: reduce) {
+      .hud-done-chevron > svg { transition: none; }
     }
     .hud-done-body {
       padding-top: 10px;
     }
     .hidden { display: none !important; }
+    html.is-collapsed,
+    html.is-collapsed body {
+      margin: 0 !important;
+      padding: 0 !important;
+      height: 0 !important;
+      min-height: 0 !important;
+      max-height: 0 !important;
+      line-height: 0 !important;
+      font-size: 0 !important;
+      border: 0 !important;
+      overflow: hidden !important;
+    }
   </style>
 </head>
 <body>
@@ -710,14 +923,10 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
   <div id="hud-root" class="hud-wrap hidden">
     <details id="hud-done-fold" class="hud-done-fold hidden">
       <summary class="hud-done-summary">
-        <span class="hud-done-left">
-          <span id="hud-done-dot" class="hud-dot dot-done"></span>
-          <span id="hud-done-text"></span>
-        </span>
-        <span class="hud-done-right">
-          <span id="hud-done-stats"></span>
-          <span class="hud-fold-chevron">›</span>
-        </span>
+        <span id="hud-done-dot" class="hud-done-icon is-done"></span>
+        <span id="hud-done-text" class="hud-done-text"></span>
+        <span id="hud-done-stats" class="hud-done-stats"></span>
+        <span class="hud-done-chevron" aria-hidden="true"><svg viewBox="0 0 16 16" width="16" height="16"><path d="M6 4L10 8L6 12" fill="none" stroke="currentColor" stroke-width="1.17" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
       </summary>
       <div id="hud-done-body" class="hud-done-body"></div>
     </details>
@@ -735,8 +944,10 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
           <div id="hud-stats" class="hud-stats"></div>
         </div>
 
-        <div class="hud-card">
+        <div id="hud-card" class="hud-card">
+          <p id="hud-list-before" class="hud-list-note hidden"></p>
           <ul id="hud-list" class="hud-list"></ul>
+          <p id="hud-list-after" class="hud-list-note hidden"></p>
         </div>
       </div>
     </div>
@@ -744,6 +955,7 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
 
   <script>
     (() => {
+      /* task-hud-stop-fold-v1 */
       const $ = (id) => document.getElementById(id);
       let currentData = null;
 
@@ -756,17 +968,52 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
         return h > 0 ? \`\${h}h \${m}m \${s}s\` : \`\${m}m \${s}s\`;
       }
 
+      // 按宿主 --background（缺省时看 --foreground，再缺省看系统偏好）切换任务卡片的深浅色令牌
+      function syncHudTheme() {
+        try {
+          const probe = document.createElement('span');
+          probe.style.cssText = 'position:absolute;visibility:hidden;pointer-events:none';
+          document.documentElement.appendChild(probe);
+          const lumOf = (varName) => {
+            probe.style.color = 'var(' + varName + ', transparent)';
+            const c = getComputedStyle(probe).color || '';
+            const body = c.slice(c.indexOf('(') + 1).replace(/^\\s*[a-z][\\w-]*\\s+/i, '');
+            const nums = (body.match(/[\\d.]+/g) || []).map(Number);
+            if (nums.length < 3 || (nums.length >= 4 && nums[3] === 0)) return null;
+            const scale = c.startsWith('color(') ? 1 : 255;
+            const [r, g, b] = nums.slice(0, 3).map((v) => v / scale);
+            return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+          };
+          const bgLum = lumOf('--background');
+          const fgLum = bgLum === null ? lumOf('--foreground') : null;
+          probe.remove();
+          const dark = bgLum !== null
+            ? bgLum < 0.5
+            : fgLum !== null
+            ? fgLum > 0.5
+            : window.matchMedia('(prefers-color-scheme: dark)').matches;
+          document.documentElement.dataset.hudTheme = dark ? 'dark' : 'light';
+        } catch {}
+      }
+      syncHudTheme();
+      try {
+        new MutationObserver(syncHudTheme).observe(document.documentElement, { attributes: true, attributeFilter: ['style', 'class'] });
+        window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', syncHudTheme);
+      } catch {}
+
+      // 16×16 图标，几何与 Claude 任务列表的 CheckCircleFilled / Placeholder / DotsCircle 一致
+      const HUD_ICON_CHECK = '<svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path fill="currentColor" fill-rule="evenodd" d="M1.333 8A6.667 6.667 0 1 0 14.667 8A6.667 6.667 0 1 0 1.333 8ZM4.849 8.505L6.949 10.795A0.585 0.585 0 0 0 7.86 10.734L11.2 5.934A0.585 0.585 0 0 0 10.24 5.266L7.317 9.466L5.711 7.715A0.585 0.585 0 0 0 4.849 8.505Z"/></svg>';
+      const HUD_ICON_PENDING = '<svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><circle cx="8" cy="8" r="6.165" fill="none" stroke="currentColor" stroke-width="1.19" stroke-linecap="round" stroke-dasharray="1.868 2.974" stroke-dashoffset="3.355" transform="rotate(22.5 8 8)"/></svg>';
+      const HUD_ICON_PAUSED = '<svg class="hud-icon-paused" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><circle cx="8" cy="8" r="6.165" fill="none" stroke="currentColor" stroke-width="1.17"/><circle cx="5.49" cy="8" r="0.83" fill="currentColor"/><circle cx="8" cy="8" r="0.83" fill="currentColor"/><circle cx="10.51" cy="8" r="0.83" fill="currentColor"/></svg>';
+      const HUD_ICON_SPINNER = '<span class="hud-spinner" aria-hidden="true"><span class="hud-spinner-track"></span><span class="hud-spinner-arc"></span></span>';
+      const HUD_ICON_FAILED = '<svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><circle cx="8" cy="8" r="6.667" fill="#ef4444"/><path d="M5.9 5.9l4.2 4.2M10.1 5.9l-4.2 4.2" fill="none" stroke="#fff" stroke-width="1.17" stroke-linecap="round"/></svg>';
+
+      // in_progress 同时放 spinner 与 DotsCircle：运行中显示 spinner，卡片冻结（.is-paused）后改显示 DotsCircle
       function iconSvg(status) {
-        if (status === 'completed') {
-          return '<svg viewBox="0 0 16 16" width="15" height="15"><circle cx="8" cy="8" r="6.5" fill="currentColor" opacity="0.82"/><path d="M5.2 8.2l2 2 3.8-4.2" fill="none" stroke="var(--card, #fff)" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
-        }
-        if (status === 'in_progress') {
-          return '<svg viewBox="0 0 16 16" width="15" height="15"><circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="1.4" opacity="0.72"/></svg>';
-        }
-        if (status === 'failed') {
-          return '<svg viewBox="0 0 16 16" width="15" height="15"><circle cx="8" cy="8" r="6.5" fill="#ef4444"/><path d="M5.6 5.6l4.8 4.8M10.4 5.6l-4.8 4.8" stroke="#fff" stroke-width="1.5" stroke-linecap="round"/></svg>';
-        }
-        return '<svg viewBox="0 0 16 16" width="15" height="15"><circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="1.3" stroke-dasharray="2.4 2.4" opacity="0.58"/></svg>';
+        if (status === 'completed') return HUD_ICON_CHECK;
+        if (status === 'in_progress') return HUD_ICON_SPINNER + HUD_ICON_PAUSED;
+        if (status === 'failed') return HUD_ICON_FAILED;
+        return HUD_ICON_PENDING;
       }
 
       function esc(s) {
@@ -779,6 +1026,47 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
         s = s.replace(/\\*\\*([^*]+)\\*\\*/g, '<strong>$1</strong>');
         s = s.replace(/\\n/g, '<br/>');
         return s;
+      }
+
+      function formatTaskTitleHtml(raw) {
+        let s = esc(raw);
+        s = s.replace(/\`([^\`]+)\`/g, '<code class="hud-item-code">$1</code>');
+        s = s.replace(/\\*\\*([^*]+)\\*\\*/g, '<strong>$1</strong>');
+        return s;
+      }
+
+      function renderTaskItem(t) {
+        const stateCls =
+          t.status === 'completed' ? 'is-done' : t.status === 'in_progress' ? 'is-active' : t.status === 'failed' ? 'is-failed' : 'is-pending';
+        return '<li class="hud-item ' + stateCls + '"><span class="hud-item-icon">' + iconSvg(t.status) + '</span><span class="hud-item-text">' + formatTaskTitleHtml(t.title) + '</span></li>';
+      }
+
+      // 与 Claude 任务列表相同的 12 条窗口：以首个 in_progress（否则首个未完成项）为锚，前面留 1 条已完成
+      function windowTasks(list, size) {
+        let focus = list.findIndex((t) => t.status === 'in_progress');
+        if (focus < 0) focus = list.findIndex((t) => t.status !== 'completed');
+        const anchor = focus >= 0 ? focus : list.length;
+        const start = Math.max(0, Math.min(anchor - 1, list.length - size));
+        const after = list.slice(start + size);
+        return {
+          visible: list.slice(start, start + size),
+          hiddenBefore: start,
+          openAfter: after.filter((t) => t.status !== 'completed').length,
+        };
+      }
+
+      function setListNote(id, text) {
+        const el = $(id);
+        if (!el) return;
+        el.textContent = text;
+        el.classList.toggle('hidden', !text);
+      }
+
+      function renderTaskList(tasks) {
+        const win = windowTasks(tasks, 12);
+        $('hud-list').innerHTML = win.visible.map(renderTaskItem).join('');
+        setListNote('hud-list-before', win.hiddenBefore > 0 ? (win.hiddenBefore === 1 ? '1 earlier step' : win.hiddenBefore + ' earlier steps') : '');
+        setListNote('hud-list-after', win.openAfter > 0 ? win.openAfter + ' more to go' : '');
       }
 
       function renderToolRow(tool) {
@@ -819,13 +1107,17 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
       function renderTimer() {
         if (!currentData) return;
         const isRunning = currentData.status === 'running';
-        $('hud-dot').className = \`hud-dot \${isRunning ? 'dot-running' : 'dot-done'}\`;
+        const isInterrupted = currentData.status === 'interrupted';
+        const isUserCanceled = isInterrupted && currentData.terminationReason === 'USER_CANCELED';
+        $('hud-dot').className = \`hud-dot \${isRunning ? 'dot-running' : isInterrupted ? 'dot-superseded' : 'dot-done'}\`;
         if (isRunning && currentData.startedAt) {
           $('hud-timer-label').textContent = '本轮对话已用时';
           $('hud-timer-val').textContent = formatDuration(Date.now() - currentData.startedAt);
         } else {
-          $('hud-timer-label').textContent = '本轮对话用时';
-          const ms = currentData.elapsedMs || (currentData.startedAt ? Date.now() - currentData.startedAt : 0);
+          $('hud-timer-label').textContent = isUserCanceled ? '停止前用时' : isInterrupted ? '中断前用时' : '本轮对话用时';
+          const ms = currentData.hasExplicitElapsed
+            ? Math.max(0, Number(currentData.elapsedMs))
+            : currentData.elapsedMs || (currentData.startedAt ? Date.now() - currentData.startedAt : 0);
           $('hud-timer-val').textContent = formatDuration(ms);
         }
       }
@@ -960,26 +1252,36 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
       let doneFreezeTimer = null;
       let bc = null;
       try {
-        bc = new BroadcastChannel('task_hud_live_slot');
+        const rawPath = String(location.pathname || location.href || '').split(/[?#]/)[0];
+        const pathParts = rawPath.split('/').filter(Boolean);
+        const scopeKey = pathParts.length >= 2 ? pathParts[pathParts.length - 2] : 'default';
+        bc = new BroadcastChannel('task_hud_live_slot:' + scopeKey);
         bc.onmessage = (ev) => {
           const msg = ev?.data;
           if (!msg || msg.type !== 'CLAIM' || msg.instanceId === myInstanceId) return;
-          if (isCompletedFrozen || isSuperseded || currentData?.status === 'done') return;
+          if (isCompletedFrozen || currentData?.status === 'done') return;
+          if (currentData?.status === 'interrupted' && currentData?.terminationReason === 'USER_CANCELED') return;
           if ((msg.mountedAt || 0) >= myMountedAt) {
-            freezeAsSuperseded();
+            collapseSelf();
           }
         };
       } catch {}
 
       function collapseSelf() {
+        /* task-hud-collapse-v1 */
         if (isCollapsed) return;
         isCollapsed = true;
         if (clockTimer) { clearInterval(clockTimer); clockTimer = null; }
         if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
         if (doneFreezeTimer) { clearTimeout(doneFreezeTimer); doneFreezeTimer = null; }
-        document.documentElement.style.cssText = 'margin:0!important;padding:0!important;height:0!important;min-height:0!important;max-height:0!important;overflow:hidden!important;display:none!important';
+        try {
+          if (bc) { bc.close(); bc = null; }
+        } catch {}
+        document.documentElement.classList.add('is-collapsed');
+        const collapsedCss = 'margin:0!important;padding:0!important;height:0!important;min-height:0!important;max-height:0!important;line-height:0!important;font-size:0!important;border:0!important;overflow:hidden!important;';
+        document.documentElement.style.cssText = collapsedCss;
         if (document.body) {
-          document.body.style.cssText = 'margin:0!important;padding:0!important;height:0!important;min-height:0!important;max-height:0!important;overflow:hidden!important;display:none!important';
+          document.body.style.cssText = collapsedCss;
           document.body.innerHTML = '';
         }
       }
@@ -998,6 +1300,8 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
         const liveBodyEl = $('hud-live-body');
         const dotEl = $('hud-done-dot');
         if (!rootEl || !doneFoldEl || !doneBodyEl || !liveBodyEl) return;
+        const cardEl = $('hud-card');
+        if (cardEl) cardEl.classList.add('is-paused');
 
         const rawTasks = Array.isArray(currentData?.tasks) ? currentData.tasks : [];
         const tasks = normalizeTasks(rawTasks, false);
@@ -1008,7 +1312,7 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
         const durationStr = formatDuration(ms);
         const taskPart = tasks.length > 0 ? \`已转入后续追问 · 已完成 \${doneCount}/\${tasks.length} 项\` : '已转入后续追问';
 
-        if (dotEl) dotEl.className = 'hud-dot dot-superseded';
+        if (dotEl) { dotEl.className = 'hud-done-icon is-superseded'; dotEl.innerHTML = HUD_ICON_PAUSED; }
         $('hud-done-text').textContent = ms > 0 ? \`中断前用时 \${durationStr} · \${taskPart}\` : taskPart;
         $('hud-done-stats').textContent = currentData?.statsText || '';
         doneBodyEl.appendChild(liveBodyEl);
@@ -1018,13 +1322,16 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
       }
 
       function render(data) {
-        if (!data || isCollapsed || isSuperseded) return;
-        if (data.collapsed) {
+        if (!data || isCollapsed) return;
+        if (data.collapsed || data.status === 'collapsed') {
           collapseSelf();
           return;
         }
+        if (isSuperseded) return;
         const sig = JSON.stringify({
           status: data.status,
+          terminationReason: data.terminationReason || '',
+          collapsed: Boolean(data.collapsed),
           tasks: data.tasks,
           logs: data.logs,
           steps: data.steps,
@@ -1038,7 +1345,8 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
         const rawTasks = Array.isArray(data.tasks) ? data.tasks : [];
         const allTasksCompleted = rawTasks.length > 0 && rawTasks.every((t) => t.status === 'completed');
         const isDone = Boolean(data.status === 'done' || allTasksCompleted);
-        currentData.status = isDone ? 'done' : 'running';
+        const isInterrupted = Boolean(!isDone && data.status === 'interrupted');
+        currentData.status = isDone ? 'done' : isInterrupted ? 'interrupted' : 'running';
 
         const tasks = normalizeTasks(rawTasks, isDone);
         const rawLogs = Array.isArray(data.logs) && data.logs.length > 0
@@ -1057,6 +1365,7 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
         const liveBodyEl = $('hud-live-body');
         const logsEl = $('hud-logs');
         const panelEl = $('hud-panel');
+        const cardEl = $('hud-card');
 
         const timelineHtml = buildTimelineHtml(logs, steps);
         if (timelineHtml) {
@@ -1069,19 +1378,14 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
 
         if (tasks.length > 0) {
           panelEl.classList.remove('hidden');
-          $('hud-list').innerHTML = tasks
-            .map((t) => {
-              const textCls = t.status === 'completed' ? 'hud-item-done' : 'hud-item-active';
-              return \`<li class="hud-item"><span class="hud-item-icon">\${iconSvg(t.status)}</span><span class="\${textCls}">\${esc(t.title)}</span></li>\`;
-            })
-            .join('');
+          renderTaskList(tasks);
         } else {
           panelEl.classList.add('hidden');
         }
 
         if (timelineHtml || tasks.length > 0) {
           rootEl.classList.remove('hidden');
-          if (!isDone) {
+          if (!isDone && !isInterrupted) {
             try {
               if (bc) bc.postMessage({ type: 'CLAIM', instanceId: myInstanceId, mountedAt: myMountedAt });
             } catch {}
@@ -1089,13 +1393,13 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
         } else if (data.status === 'running' && data.startedAt) {
           rootEl.classList.remove('hidden');
           panelEl.classList.remove('hidden');
-          $('hud-list').innerHTML = '<li class="hud-item"><span class="hud-item-icon">' + iconSvg('in_progress') + '</span><span class="hud-item-active">正在分析并拆解执行步骤…</span></li>';
-          if (!isDone) {
+          renderTaskList([{ status: 'in_progress', title: '正在分析并拆解执行步骤…' }]);
+          if (!isDone && !isInterrupted) {
             try {
               if (bc) bc.postMessage({ type: 'CLAIM', instanceId: myInstanceId, mountedAt: myMountedAt });
             } catch {}
           }
-        } else if (isDone && (Number(data.elapsedMs || 0) > 0 || Number(data.startedAt || 0) > 0)) {
+        } else if ((isDone || isInterrupted) && (data.hasExplicitElapsed || Number(data.elapsedMs || 0) > 0 || Number(data.startedAt || 0) > 0)) {
           rootEl.classList.remove('hidden');
         } else {
           rootEl.classList.add('hidden');
@@ -1103,9 +1407,10 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
         }
 
         if (isDone) {
-          isCompletedFrozen = true;
+          /* task-hud-unfreeze-v2 */
+          if (cardEl) cardEl.classList.remove('is-paused');
           const dotEl = $('hud-done-dot');
-          if (dotEl) dotEl.className = 'hud-dot dot-done';
+          if (dotEl) { dotEl.className = 'hud-done-icon is-done'; dotEl.innerHTML = HUD_ICON_CHECK; }
           const doneCount = tasks.filter((t) => t.status === 'completed').length;
           let ms = Number(data.elapsedMs || 0);
           if (ms <= 0 && data.startedAt && data.startedAt > 1000000000000) {
@@ -1118,14 +1423,50 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
           doneBodyEl.appendChild(liveBodyEl);
           doneFoldEl.classList.remove('hidden');
           doneFoldEl.open = false;
-          if (!doneFreezeTimer && Number(data.elapsedMs || 0) > 0) {
+          if (!doneFreezeTimer) {
             doneFreezeTimer = setTimeout(() => {
+              isCompletedFrozen = true;
+              if (clockTimer) { clearInterval(clockTimer); clockTimer = null; }
+              if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+            }, 2500);
+          }
+        } else if (isInterrupted) {
+          isCompletedFrozen = false;
+          if (doneFreezeTimer) { clearTimeout(doneFreezeTimer); doneFreezeTimer = null; }
+          if (clockTimer) { clearInterval(clockTimer); clockTimer = null; }
+          if (cardEl) cardEl.classList.add('is-paused');
+          const dotEl = $('hud-done-dot');
+          if (dotEl) { dotEl.className = 'hud-done-icon is-superseded'; dotEl.innerHTML = HUD_ICON_PAUSED; }
+          const doneCount = tasks.filter((t) => t.status === 'completed').length;
+          let ms = data.hasExplicitElapsed ? Math.max(0, Number(data.elapsedMs)) : Number(data.elapsedMs || 0);
+          if (!data.hasExplicitElapsed && ms <= 0 && data.startedAt && data.startedAt > 1000000000000) {
+            ms = Math.max(0, Date.now() - data.startedAt);
+          }
+          const durationStr = formatDuration(ms);
+          const isUserCanceled = data.terminationReason === 'USER_CANCELED';
+          if (isUserCanceled) {
+            const taskPart = tasks.length > 0 ? \`已停止 · 用时 \${durationStr} · 已完成 \${doneCount}/\${tasks.length} 项\` : \`已停止 · 用时 \${durationStr}\`;
+            $('hud-done-text').textContent = taskPart;
+          } else {
+            const taskPart = tasks.length > 0 ? \`已完成 \${doneCount}/\${tasks.length} 项\` : '已中断';
+            $('hud-done-text').textContent = ms > 0 ? \`中断前用时 \${durationStr} · \${taskPart}\` : taskPart;
+          }
+          $('hud-done-stats').textContent = data.statsText || '';
+          doneBodyEl.appendChild(liveBodyEl);
+          doneFoldEl.classList.remove('hidden');
+          doneFoldEl.open = false;
+          if (isUserCanceled && !doneFreezeTimer) {
+            doneFreezeTimer = setTimeout(() => {
+              isCompletedFrozen = true;
               if (clockTimer) { clearInterval(clockTimer); clockTimer = null; }
               if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
             }, 2500);
           }
         } else {
+          isCompletedFrozen = false;
+          if (cardEl) cardEl.classList.remove('is-paused');
           if (doneFreezeTimer) { clearTimeout(doneFreezeTimer); doneFreezeTimer = null; }
+          if (!clockTimer) { clockTimer = setInterval(renderTimer, 1000); }
           if (liveBodyEl.parentElement !== rootEl) {
             rootEl.appendChild(liveBodyEl);
           }
@@ -1202,7 +1543,18 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
         }
         const tObj = parseHudJsonBlock(tRaw, true);
         const rObj = parseHudJsonBlock(rRaw, false);
-        return { ...rObj, ...tObj, status: tObj.status || rObj.status || 'running' };
+        const collapsed = Boolean(
+          rObj.collapsed || tObj.collapsed || rObj.status === 'collapsed' || tObj.status === 'collapsed'
+        );
+        const rStatus = typeof rObj.status === 'string' ? rObj.status : '';
+        const status = collapsed
+          ? 'collapsed'
+          : (rStatus === 'interrupted' || rStatus === 'done')
+          ? rStatus
+          : (tObj.status || rStatus || 'running');
+        const terminationReason = String(rObj.terminationReason || tObj.terminationReason || '');
+        const hasExplicitElapsed = typeof rObj.elapsedMs === 'number' && Number.isFinite(rObj.elapsedMs);
+        return { ...rObj, ...tObj, collapsed, status, terminationReason, hasExplicitElapsed };
       }
 
       async function pollSelf() {
@@ -1219,8 +1571,12 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
 
       const merged = parseMerged();
       if (merged) render(merged);
-      clockTimer = setInterval(renderTimer, 1000);
-      pollTimer = setInterval(pollSelf, 600);
+      if (!isCollapsed && currentData && currentData.status === 'running' && !clockTimer) {
+        clockTimer = setInterval(renderTimer, 1000);
+      }
+      if (!isCollapsed && !isCompletedFrozen && !pollTimer) {
+        pollTimer = setInterval(pollSelf, 600);
+      }
     })();
   </script>
 </body>
@@ -1229,14 +1585,135 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
 
 const HUD_TASKS_SCRIPT_RE = /(<script[^>]*id=["']task-hud-(?:tasks|data)["'][^>]*>)([\s\S]*?)(<\/script>)/i;
 const HUD_RUNTIME_SCRIPT_RE = /(<script[^>]*id=["']task-hud-runtime["'][^>]*>)([\s\S]*?)(<\/script>)/i;
+const HUD_TASKS_BLOCK_ANCHORED_RE = /(<script[^>]*id=["']task-hud-(?:tasks|data)["'][^>]*>)([\s\S]*?)(<\/script>)(\s*<script[^>]*id=["']task-hud-runtime["'])/i;
+const HUD_RUNTIME_BLOCK_ANCHORED_RE = /(<script[^>]*id=["']task-hud-runtime["'][^>]*>)([\s\S]*?)(<\/script>)(\s*<div[^>]*id=["']hud-root["'])/i;
 const HUD_TEMPLATE_MARKER = 'freezeAsSuperseded';
 const HUD_TEMPLATE_STYLE_MARKER = 'padding: 2px 46px 4px 0';
 const HUD_TEMPLATE_RESILIENT_MARKER = 'parseHudJsonBlock';
+const HUD_TEMPLATE_TASKCARD_MARKER = 'hud-spinner-arc';
+const HUD_TEMPLATE_UNFREEZE_MARKER = 'task-hud-unfreeze-v2';
+const HUD_TEMPLATE_SPINNER_MARKER = 'task-hud-spinner-v3';
+const HUD_TEMPLATE_DONEBAR_MARKER = 'hud-done-chevron';
+const HUD_TEMPLATE_COLLAPSE_MARKER = 'task-hud-collapse-v1';
+const HUD_TEMPLATE_STOP_FOLD_MARKER = 'task-hud-stop-fold-v1';
+
+function serializeJsonForHtmlScript(obj) {
+  return JSON.stringify(obj, null, 2)
+    .replace(/</g, '\\u003c')
+    .replace(/>/g, '\\u003e')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
+}
+
+function escapeRawJsonForHtmlScript(rawText) {
+  return String(rawText || '')
+    .replace(/</g, '\\u003c')
+    .replace(/>/g, '\\u003e')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
+}
+
+function replaceTasksScriptBlock(html, obj) {
+  const json = serializeJsonForHtmlScript(obj);
+  if (HUD_TASKS_BLOCK_ANCHORED_RE.test(html)) {
+    return html.replace(
+      HUD_TASKS_BLOCK_ANCHORED_RE,
+      (_, open, _body, close, after) => `${open}\n${json}\n  ${close}${after}`
+    );
+  }
+  if (HUD_TASKS_SCRIPT_RE.test(html)) {
+    return html.replace(
+      HUD_TASKS_SCRIPT_RE,
+      (_, open, _body, close) => `${open}\n${json}\n  ${close}`
+    );
+  }
+  return html;
+}
+
+function replaceRuntimeScriptBlock(html, obj) {
+  const json = serializeJsonForHtmlScript(obj);
+  if (HUD_RUNTIME_BLOCK_ANCHORED_RE.test(html)) {
+    return html.replace(
+      HUD_RUNTIME_BLOCK_ANCHORED_RE,
+      (_, open, _body, close, after) => `${open}\n${json}\n  ${close}${after}`
+    );
+  }
+  if (HUD_RUNTIME_SCRIPT_RE.test(html)) {
+    return html.replace(
+      HUD_RUNTIME_SCRIPT_RE,
+      (_, open, _body, close) => `${open}\n${json}\n  ${close}`
+    );
+  }
+  return html;
+}
+
+function extractTasksScriptBody(html) {
+  const s = String(html || '');
+  const anchored = s.match(HUD_TASKS_BLOCK_ANCHORED_RE);
+  if (anchored && anchored[2]) return anchored[2];
+  const fallback = s.match(HUD_TASKS_SCRIPT_RE);
+  return fallback && fallback[2] ? fallback[2] : '';
+}
+
+function extractRuntimeScriptBody(html) {
+  const s = String(html || '');
+  const anchored = s.match(HUD_RUNTIME_BLOCK_ANCHORED_RE);
+  if (anchored && anchored[2]) return anchored[2];
+  const fallback = s.match(HUD_RUNTIME_SCRIPT_RE);
+  return fallback && fallback[2] ? fallback[2] : '';
+}
+
+function isTemplateStructureBroken(html) {
+  const s = String(html || '');
+  const tasksSpan = s.match(/<script[^>]*id=["']task-hud-(?:tasks|data)["'][^>]*>([\s\S]*?)<script[^>]*id=["']task-hud-runtime["']/i);
+  if (!tasksSpan || !tasksSpan[1]) return true;
+  const tasksCloses = tasksSpan[1].match(/<\/script>/gi);
+  if (!tasksCloses || tasksCloses.length !== 1) return true;
+
+  const runtimeSpan = s.match(/<script[^>]*id=["']task-hud-runtime["'][^>]*>([\s\S]*?)<div[^>]*id=["']hud-root["']/i);
+  if (!runtimeSpan || !runtimeSpan[1]) return true;
+  const runtimeCloses = runtimeSpan[1].match(/<\/script>/gi);
+  if (!runtimeCloses || runtimeCloses.length !== 1) return true;
+
+  return false;
+}
 
 function parseHudTasksJson(html) {
-  const m = String(html || '').match(HUD_TASKS_SCRIPT_RE);
-  if (!m || !m[2]) return null;
-  return parseHudTasksJsonText(m[2]).data;
+  const body = extractTasksScriptBody(html);
+  if (!body) return null;
+  return parseHudTasksJsonText(body).data;
+}
+
+function parseHudRuntimeJson(html) {
+  const body = extractRuntimeScriptBody(html);
+  if (!body) return null;
+  try {
+    const parsed = JSON.parse(body.trim());
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+export function isHudSlotCollapsed(html) {
+  const runtimeObj = parseHudRuntimeJson(html);
+  if (runtimeObj && (runtimeObj.collapsed === true || runtimeObj.status === 'collapsed')) {
+    return true;
+  }
+  const tasksObj = parseHudTasksJson(html);
+  return Boolean(tasksObj && (tasksObj.collapsed === true || tasksObj.status === 'collapsed'));
+}
+
+export function isHudSlotCollapsedFile(artifactDir, fileName) {
+  const norm = normalizeHudFileName(fileName);
+  if (!artifactDir || !norm) return false;
+  const htmlPath = join(artifactDir, norm);
+  if (!existsSync(htmlPath)) return false;
+  try {
+    return isHudSlotCollapsed(readFileSync(htmlPath, 'utf-8'));
+  } catch {
+    return false;
+  }
 }
 
 function hasNonEmptyHudTasks(html) {
@@ -1244,31 +1721,57 @@ function hasNonEmptyHudTasks(html) {
   return Boolean(obj && Array.isArray(obj.tasks) && obj.tasks.length > 0);
 }
 
+function isHudSlotUsed(html) {
+  return hasNonEmptyHudTasks(html) || isHudSlotCollapsed(html);
+}
+
 function upgradeTemplatePreservingData(filePath) {
   if (!existsSync(filePath)) {
-    writeFileSync(filePath, HUD_HTML_TEMPLATE, { encoding: 'utf-8' });
+    writeTextAtomic(filePath, HUD_HTML_TEMPLATE);
     return;
   }
   const origHtml = readFileSync(filePath, 'utf-8');
+  const broken = isTemplateStructureBroken(origHtml);
   if (
+    !broken &&
     origHtml.includes(HUD_TEMPLATE_MARKER) &&
     origHtml.includes('isCompletedFrozen') &&
     origHtml.includes(HUD_TEMPLATE_STYLE_MARKER) &&
-    origHtml.includes(HUD_TEMPLATE_RESILIENT_MARKER)
+    origHtml.includes(HUD_TEMPLATE_RESILIENT_MARKER) &&
+    origHtml.includes(HUD_TEMPLATE_UNFREEZE_MARKER) &&
+    origHtml.includes(HUD_TEMPLATE_SPINNER_MARKER) &&
+    origHtml.includes(HUD_TEMPLATE_DONEBAR_MARKER) &&
+    origHtml.includes(HUD_TEMPLATE_COLLAPSE_MARKER) &&
+    origHtml.includes(HUD_TEMPLATE_STOP_FOLD_MARKER)
   ) {
     return;
   }
   let nextHtml = HUD_HTML_TEMPLATE;
-  const oldTasks = origHtml.match(HUD_TASKS_SCRIPT_RE);
-  if (oldTasks && oldTasks[2]) {
-    nextHtml = nextHtml.replace(HUD_TASKS_SCRIPT_RE, (_, open, _body, close) => `${open}${oldTasks[2]}${close}`);
+  const parsedTasksObj = parseHudTasksJson(origHtml);
+  if (parsedTasksObj) {
+    nextHtml = replaceTasksScriptBlock(nextHtml, parsedTasksObj);
+  } else {
+    const oldTasksBody = extractTasksScriptBody(origHtml);
+    if (oldTasksBody) {
+      const safeRaw = escapeRawJsonForHtmlScript(oldTasksBody);
+      nextHtml = nextHtml.replace(HUD_TASKS_SCRIPT_RE, (_, open, _body, close) => `${open}${safeRaw}${close}`);
+    }
   }
-  const oldRuntime = origHtml.match(HUD_RUNTIME_SCRIPT_RE);
-  if (oldRuntime && oldRuntime[2]) {
-    nextHtml = nextHtml.replace(HUD_RUNTIME_SCRIPT_RE, (_, open, _body, close) => `${open}${oldRuntime[2]}${close}`);
+  const runtimeSpan = origHtml.match(/<script[^>]*id=["']task-hud-runtime["'][^>]*>([\s\S]*?)<div[^>]*id=["']hud-root["']/i);
+  const hasRuntimeGarbage = Boolean(runtimeSpan && (runtimeSpan[1].match(/<\/script>/gi)?.length || 0) > 1);
+  const oldRuntimeBody = extractRuntimeScriptBody(origHtml);
+  if (oldRuntimeBody && !hasRuntimeGarbage) {
+    try {
+      const parsedRuntimeObj = JSON.parse(oldRuntimeBody.trim());
+      if (parsedRuntimeObj && typeof parsedRuntimeObj === 'object' && !Array.isArray(parsedRuntimeObj)) {
+        nextHtml = replaceRuntimeScriptBlock(nextHtml, parsedRuntimeObj);
+      }
+    } catch {
+      // ignore corrupted runtime json and keep clean default
+    }
   }
   if (nextHtml !== origHtml) {
-    writeFileSync(filePath, nextHtml, { encoding: 'utf-8' });
+    writeTextAtomic(filePath, nextHtml);
   }
 }
 
@@ -1282,7 +1785,7 @@ function resolveTargetTurnSlotCount(artifactDir, minCount = 24) {
       if (!Number.isFinite(idx) || idx <= 0) continue;
       try {
         const html = readFileSync(join(artifactDir, entry), 'utf-8');
-        if (hasNonEmptyHudTasks(html) && idx > maxUsed) {
+        if (isHudSlotUsed(html) && idx > maxUsed) {
           maxUsed = idx;
         }
       } catch {
@@ -1308,7 +1811,7 @@ export function findNextAvailableTurnSlot(artifactDir, state = {}) {
       if (!Number.isFinite(idx) || idx <= 0) continue;
       try {
         const html = readFileSync(join(artifactDir, entry), 'utf-8');
-        if (hasNonEmptyHudTasks(html) && idx > maxUsed) {
+        if (isHudSlotUsed(html) && idx > maxUsed) {
           maxUsed = idx;
         }
       } catch {
@@ -1353,24 +1856,133 @@ export function seedDefaultHudTasksIfEmpty(artifactDir, fileName, { userInput = 
     const cleanReq = String(userInput || '').replace(/\s+/g, ' ').trim();
     const shortReq = cleanReq.length > 28 ? `${cleanReq.slice(0, 28)}…` : cleanReq;
     const initialLog = shortReq
-      ? `已自动挂载任务进度面板，正在分析与处理请求（“${shortReq}”）。`
-      : '已自动挂载任务进度面板，正在检索上下文并分析执行方案。';
+      ? `正在检索上下文并分析请求（“${shortReq}”）。`
+      : '正在检索上下文并分析当前任务。';
 
     const defaultObj = {
       taskTitle: '任务进度',
+      autoSeeded: true,
       logs: [initialLog],
       tasks: [
-        { id: '1', title: '检索上下文并分析处理当前任务', status: 'in_progress' },
+        { id: '1', title: '检索上下文与关键信息', status: 'in_progress' },
+        { id: '2', title: '分析定位并整理最终方案', status: 'pending' },
       ],
     };
 
     if (!HUD_TASKS_SCRIPT_RE.test(origHtml)) return false;
-    const nextHtml = origHtml.replace(
-      HUD_TASKS_SCRIPT_RE,
-      (_, open, _body, close) => `${open}\n${JSON.stringify(defaultObj, null, 2)}\n  ${close}`
-    );
+    const nextHtml = replaceTasksScriptBlock(origHtml, defaultObj);
     if (nextHtml !== origHtml) {
-      writeFileSync(htmlPath, nextHtml, { encoding: 'utf-8' });
+      writeTextAtomic(htmlPath, nextHtml);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 在 Plan mode 通过 exit_plan_mode 移交执行阶段时，将 autoSeeded 面板推进至执行阶段。
+ */
+export function advanceAutoSeededHudForPlanHandover(artifactDir, fileName) {
+  const norm = normalizeHudFileName(fileName);
+  if (!artifactDir || !norm) return false;
+  const htmlPath = join(artifactDir, norm);
+  if (!existsSync(htmlPath)) return false;
+
+  try {
+    const origHtml = readFileSync(htmlPath, 'utf-8');
+    const obj = parseHudTasksJson(origHtml);
+    if (!obj || obj.autoSeeded !== true) return false;
+
+    const logs = Array.isArray(obj.logs)
+      ? obj.logs.map((s) => String(s || '').trim()).filter(Boolean)
+      : obj.summary
+      ? [String(obj.summary).trim()]
+      : [];
+    const lastLog = logs.length > 0 ? logs[logs.length - 1] : '';
+    if (!lastLog.includes('移交执行')) {
+      logs.push('已完成只读规划，正在移交执行阶段。');
+    }
+
+    const nextObj = {
+      taskTitle: String(obj.taskTitle || '').trim() || '任务进度',
+      autoSeeded: true,
+      logs,
+      tasks: [
+        { id: '1', title: '检索上下文并完成规划方案', status: 'completed' },
+        { id: '2', title: '按规划执行修改与验证', status: 'in_progress' },
+      ],
+    };
+
+    if (!HUD_TASKS_SCRIPT_RE.test(origHtml)) return false;
+    const nextHtml = replaceTasksScriptBlock(origHtml, nextObj);
+    if (nextHtml !== origHtml) {
+      writeTextAtomic(htmlPath, nextHtml);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 清理未被真正嵌入聊天流中的 autoSeeded 孤儿槽位，避免影响下一轮槽位分配。
+ */
+export function clearAutoSeededHudSlot(artifactDir, fileName) {
+  const norm = normalizeHudFileName(fileName);
+  if (!artifactDir || !norm) return false;
+  const htmlPath = join(artifactDir, norm);
+  if (!existsSync(htmlPath)) return false;
+
+  try {
+    const origHtml = readFileSync(htmlPath, 'utf-8');
+    const obj = parseHudTasksJson(origHtml);
+    if (!obj || obj.autoSeeded !== true) return false;
+
+    writeTextAtomic(htmlPath, HUD_HTML_TEMPLATE);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 当用户中途追加需求或切换到新任务栏时，彻底收起并隐藏上一个未完成的任务栏（0px 终态）。
+ */
+export function collapseArtifactHudFile(artifactDir, fileName, { now = Date.now(), turn = null } = {}) {
+  const norm = normalizeHudFileName(fileName);
+  if (!artifactDir || !norm) return false;
+  const htmlPath = join(artifactDir, norm);
+  upgradeTemplatePreservingData(htmlPath);
+  if (!existsSync(htmlPath)) return false;
+
+  try {
+    const origHtml = readFileSync(htmlPath, 'utf-8');
+    let html = origHtml;
+
+    const prevTasks = parseHudTasksJson(origHtml);
+    const nextTasksObj =
+      prevTasks && typeof prevTasks === 'object'
+        ? { ...prevTasks, collapsed: true, status: 'collapsed' }
+        : { taskTitle: '任务进度', collapsed: true, status: 'collapsed', logs: [], tasks: [] };
+    html = replaceTasksScriptBlock(html, nextTasksObj);
+
+    const prevRuntime = parseHudRuntimeJson(origHtml);
+    const startedAt = turn?.startedAt || prevRuntime?.startedAt || 0;
+    const elapsedMs = turn?.elapsedMs || (startedAt ? Math.max(0, now - startedAt) : 0);
+    const nextRuntimeObj = {
+      status: 'collapsed',
+      collapsed: true,
+      turnIndex: turn?.turnIndex || prevRuntime?.turnIndex || 1,
+      startedAt,
+      elapsedMs,
+      statsText: '',
+      steps: [],
+    };
+    html = replaceRuntimeScriptBlock(html, nextRuntimeObj);
+
+    if (html !== origHtml) {
+      writeTextAtomic(htmlPath, html);
     }
     return true;
   } catch {
@@ -1410,17 +2022,17 @@ export function resetArtifactHudSlots(artifactDir, { minTurnSlots = 24 } = {}) {
     for (const name of allNames) {
       const htmlPath = join(artifactDir, name);
       if (!existsSync(htmlPath)) {
-        writeFileSync(htmlPath, HUD_HTML_TEMPLATE, { encoding: 'utf-8' });
+        writeTextAtomic(htmlPath, HUD_HTML_TEMPLATE);
         continue;
       }
       const origHtml = readFileSync(htmlPath, 'utf-8');
-      // 严禁清空已写入过任务的历史轮次或历史兼容文件，只对其执行无损外壳升级
-      if (hasNonEmptyHudTasks(origHtml)) {
+      // 严禁清空已写入过任务或已收起的历史轮次文件，只对其执行无损外壳升级
+      if (isHudSlotUsed(origHtml)) {
         upgradeTemplatePreservingData(htmlPath);
         continue;
       }
       if (origHtml !== HUD_HTML_TEMPLATE) {
-        writeFileSync(htmlPath, HUD_HTML_TEMPLATE, { encoding: 'utf-8' });
+        writeTextAtomic(htmlPath, HUD_HTML_TEMPLATE);
       }
     }
 
@@ -1446,7 +2058,18 @@ function resolveCompactPath(transcriptPath) {
  * 将本轮实时计时（startedAt / elapsedMs）、工具统计、工具链 steps 与收尾对号状态直接写回对应轮次 HTML 文件的 #task-hud-runtime：
  * 严格只更新本轮显式绑定的目标槽位（targetFileName / activeTurn.hudFileName），绝不覆写历史轮次文件。
  */
-export function syncArtifactHudFile(artifactDir, state, { turnFinished = false, now = Date.now(), isPreToolUse = false, targetFileName = '' } = {}) {
+export function syncArtifactHudFile(
+  artifactDir,
+  state,
+  {
+    turnFinished = false,
+    turnInterrupted = false,
+    terminationReason = '',
+    now = Date.now(),
+    isPreToolUse = false,
+    targetFileName = '',
+  } = {}
+) {
   if (!artifactDir) return false;
   const fileName = normalizeHudFileName(
     targetFileName ||
@@ -1459,18 +2082,19 @@ export function syncArtifactHudFile(artifactDir, state, { turnFinished = false, 
   upgradeTemplatePreservingData(htmlPath);
   if (!existsSync(htmlPath)) return false;
 
-  const tasksRegex = HUD_TASKS_SCRIPT_RE;
   const runtimeRegex = HUD_RUNTIME_SCRIPT_RE;
 
   try {
     const origHtml = readFileSync(htmlPath, 'utf-8');
+    if (isHudSlotCollapsed(origHtml)) return false;
     let html = origHtml;
 
-    const m = html.match(tasksRegex);
+    const tasksBody = extractTasksScriptBody(html);
     let parsedTasks = [];
     let parsedLogs = [];
-    if (m && m[2]) {
-      const { data: tJson, repaired } = parseHudTasksJsonText(m[2]);
+    if (tasksBody) {
+      const hasUnescapedScriptTag = /<\/script/i.test(tasksBody);
+      const { data: tJson, repaired } = parseHudTasksJsonText(tasksBody);
       if (tJson) {
         if (tJson.taskTitle) state.taskTitle = String(tJson.taskTitle).trim();
         parsedLogs = Array.isArray(tJson.logs)
@@ -1487,41 +2111,54 @@ export function syncArtifactHudFile(artifactDir, state, { turnFinished = false, 
         let hadUnfinished = false;
         if (Array.isArray(tJson.tasks) && tJson.tasks.length > 0) {
           parsedTasks = normalizeAndAdvanceTasks(tJson.tasks, { turnFinished, now });
+          if (turnFinished && tJson.autoSeeded === true && !parsedTasks.some((t) => t.status === 'failed')) {
+            for (const item of parsedTasks) {
+              if (item.status !== 'completed') {
+                item.status = 'completed';
+                item.updatedAt = now;
+              }
+            }
+          }
           state.tasks = parsedTasks;
           hadUnfinished = tJson.tasks.some((t, idx) => t.status !== parsedTasks[idx]?.status);
         }
-        if (repaired || (turnFinished && hadUnfinished)) {
+        if (repaired || hasUnescapedScriptTag || (turnFinished && hadUnfinished)) {
           const fixedObj = {
             taskTitle: state.taskTitle || '任务进度',
+            ...(tJson.autoSeeded ? { autoSeeded: true } : {}),
             logs: parsedLogs.length > 0 ? parsedLogs : state.summary ? [state.summary] : [],
             ...(tJson.status ? { status: tJson.status } : {}),
             tasks: parsedTasks.map((t) => ({ id: t.id, title: t.title, status: t.status })),
           };
-          html = html.replace(
-            tasksRegex,
-            (_, open, _body, close) => `${open}\n${JSON.stringify(fixedObj, null, 2)}\n  ${close}`
-          );
+          html = replaceTasksScriptBlock(html, fixedObj);
         }
       }
     }
 
-    const compactTranscript = resolveCompactPath(state.transcriptPath);
-    const steps = buildTurnStepsFromTranscript(compactTranscript, {
-      includeLatestTools: Boolean(turnFinished && !isPreToolUse),
-    });
-
     const activeTurn = state.activeTurn;
     const lastTurn = state.lastCompletedTurn;
-    const isDone = Boolean(turnFinished || !activeTurn);
+    const isInterrupted = Boolean(turnInterrupted && !turnFinished);
+    const isDone = Boolean(turnFinished || (!activeTurn && !isInterrupted));
+    const status = isInterrupted ? 'interrupted' : isDone ? 'done' : 'running';
+
+    const compactTranscript = resolveCompactPath(state.transcriptPath);
+    const steps = buildTurnStepsFromTranscript(compactTranscript, {
+      includeLatestTools: Boolean((turnFinished || isInterrupted) && !isPreToolUse),
+    });
+
     const turnIndex = activeTurn?.turnIndex || lastTurn?.turnIndex || 1;
     const startedAt = activeTurn?.startedAt || lastTurn?.startedAt || now;
-    const elapsedMs = isDone
-      ? (lastTurn?.elapsedMs || Math.max(0, now - startedAt))
+    const elapsedMs = (isDone || isInterrupted)
+      ? (typeof lastTurn?.elapsedMs === 'number' && Number.isFinite(lastTurn.elapsedMs)
+          ? Math.max(0, lastTurn.elapsedMs)
+          : Math.max(0, now - startedAt))
       : 0;
     const statsText = summarizeToolStats(activeTurn?.stats || lastTurn?.stats) || '';
+    const resolvedReason = isInterrupted ? String(terminationReason || lastTurn?.terminationReason || '') : '';
 
     const runtimeObj = {
-      status: isDone ? 'done' : 'running',
+      status,
+      ...(resolvedReason ? { terminationReason: resolvedReason } : {}),
       turnIndex,
       startedAt,
       elapsedMs,
@@ -1529,15 +2166,12 @@ export function syncArtifactHudFile(artifactDir, state, { turnFinished = false, 
       steps,
     };
 
-    if (runtimeRegex.test(html)) {
-      html = html.replace(
-        runtimeRegex,
-        (_, open, _body, close) => `${open}\n${JSON.stringify(runtimeObj, null, 2)}\n  ${close}`
-      );
+    if (runtimeRegex.test(html) || HUD_RUNTIME_BLOCK_ANCHORED_RE.test(html)) {
+      html = replaceRuntimeScriptBlock(html, runtimeObj);
     }
 
     if (html !== origHtml) {
-      writeFileSync(htmlPath, html, { encoding: 'utf-8' });
+      writeTextAtomic(htmlPath, html);
     }
     return true;
   } catch {
@@ -1628,11 +2262,12 @@ export function loadConversationState(conversationId, dataDir = resolveDataDir()
     return createEmptyConversationState(safeId);
   }
   const rawTasks = Array.isArray(saved.tasks) ? saved.tasks : [];
+  const turnFinished = !saved.activeTurn && !isTurnInterrupted(saved.lastCompletedTurn);
   return {
     ...createEmptyConversationState(safeId),
     ...saved,
     conversationId: safeId,
-    tasks: normalizeAndAdvanceTasks(rawTasks, { turnFinished: !saved.activeTurn }),
+    tasks: normalizeAndAdvanceTasks(rawTasks, { turnFinished }),
     turns: Array.isArray(saved.turns) ? saved.turns : [],
   };
 }
@@ -1640,8 +2275,9 @@ export function loadConversationState(conversationId, dataDir = resolveDataDir()
 export function saveConversationState(state, dataDir = resolveDataDir()) {
   const safeId = sanitizeConversationId(state?.conversationId);
   if (!safeId) return;
+  const turnFinished = !state.activeTurn && !isTurnInterrupted(state.lastCompletedTurn);
   if (Array.isArray(state.tasks) && state.tasks.length > 0) {
-    state.tasks = normalizeAndAdvanceTasks(state.tasks, { turnFinished: !state.activeTurn });
+    state.tasks = normalizeAndAdvanceTasks(state.tasks, { turnFinished });
   }
   state.updatedAt = Date.now();
   writeJsonAtomic(conversationStatePath(safeId, dataDir), state);
@@ -1734,6 +2370,9 @@ export function classifyTool(toolName, args = {}) {
   }
   if (name === 'invoke_subagent' || name === 'swarm') {
     return { category: 'subagents', label: '调度子代理' };
+  }
+  if (name === 'exit_plan_mode') {
+    return { category: 'otherTools', label: '完成规划并移交执行' };
   }
   return { category: 'otherTools', label: name ? `执行 ${name}` : '执行工具' };
 }

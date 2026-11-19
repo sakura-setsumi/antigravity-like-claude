@@ -16,7 +16,7 @@
      0. **选择本轮专属文件名（防多轮互相覆盖，严禁复用旧轮次文件）**：
         - 检查上文对话中已输出过的 `<agent-embed src=".../task-hud-t<K>.html">` 最高编号：
           - 若本会话此前尚未嵌入过 `task-hud-t*.html`（即使旧会话曾使用过无编号的 `task-hud.html`），本轮选 **`task-hud-t1.html`**；
-          - 若上文已嵌入过的最高编号为 `task-hud-t<K>.html`，本轮严格顺延选 **`task-hud-t<K+1>.html`**（即使上一轮中途被打断或追加新需求，也绝不能覆盖旧文件，必须递增新编号）。
+          - 若上文已嵌入过的最高编号为 `task-hud-t<K>.html`，本轮严格顺延选 **`task-hud-t<K+1>.html`**（即使上一轮中途被打断或追加新需求，Hook 会自动移除上一个未完成的任务栏，新轮次仍必须严格顺延递增新编号 `t<K+1>`，绝不能复用或覆盖旧编号）。
      1. **第 1 步（先写好任务列表，返回成功后再输出唯一 1 次 `<agent-embed>`）**：
         - 无需先 `read_file`，先调用 `edit_file` 修改 `<Artifact Directory Path>/<本轮文件名>`（例如 `task-hud-t1.html`）中的 `#task-hud-tasks`（`Target` 必须完整包含初始模板中的 `"logs": []` 与 `"tasks": []` 两个空数组，切勿截断在 `"tasks":` 导致尾部残留多余 `[]` 破坏 JSON；全程所有步骤均必须带上 `ArtifactMetadata: { Summary: "任务进度面板", UserFacing: false, RequestFeedback: false }`，切勿设为 `UserFacing: true`，否则最终总结底部会多出多余的 Artifact 卡片）：
           - `"logs"` 数组写入第 1 条小总结（说明第一步要操作的目标文件、符号或命令，关键项用反引号 `` ` `` 标出）；
@@ -36,6 +36,13 @@
           a) 先在最后一次工具调用中，通过 `edit_file` 将 `<Artifact Directory Path>/<本轮文件名>` 中的 `"tasks"` **全部设为 `"completed"`**（带上 `ArtifactMetadata: { Summary: "任务进度面板", UserFacing: false, RequestFeedback: false }`）。当 `"tasks"` 全部变为 `"completed"` 时，该独立文件会冻结并折叠成一行极简完成条（`本轮用时 ... · 已完成 N/N 项任务`），点击可展开查看本轮明细；
           b) 紧接着在**最后一轮纯文本回复**中，直接输出清晰完整的**最终总结**（切勿再次输出 `<agent-embed>`）。
 2. **保持低开销**：简单问答或单步查询无需嵌入或修改任何 `task-hud*.html` 文件。
-3. **只读模式（`Plan mode` / `Orchestrator`）与 Hook 自动兜底衔接**：
-   - 若当前处于只读规划模式导致 `edit_file` 工具不可用，无需尝试绕过限制或手动写入文件，直接推进检索与分析即可；首轮工具执行后 Hook 会自动分配空闲 `task-hud-t<K>.html` 并通过 `user_markdown` 注入面板。
-   - 一旦收到 Hook 系统提示告知“已自动挂载 `task-hud-t<K>.html`”，**切勿再额外输出 `<agent-embed>`**；若后续退出只读模式恢复了 `edit_file` 权限，直接更新该 `task-hud-t<K>.html` 中的 `"logs"` 与 `"tasks"` 并于收尾时全部设为 `"completed"`。
+3. **只读模式（`Plan mode` / `Orchestrator`）与 Hook 自动兜底规范**：
+   - 当处于只读规划模式导致 `edit_file` 工具不可用时，**不要尝试绕过只读限制或手动写文件**；收到需要 **2 个及以上步骤**（检索、分析、规划）的任务时，按以下流程执行：
+     1. **第 1 步主动嵌入唯一 1 次 `<agent-embed>` 并同时发起只读工具调用**：按第 1 条第 0 步规则顺延选定本轮文件名 `<本轮文件名>`（首次为 `task-hud-t1.html`），直接在回复文本中输出唯一一次 `<agent-embed src="file:///<Artifact Directory Path>/<本轮文件名>"></agent-embed>`（标签外不要写过程文字），**并在同一步响应中发起至少 1 个只读业务工具调用**（如 `read_file`、`run_command` 等）。Hook 会在工具启动时自动初始化该槽位的默认任务、工具链与实时计时。
+     2. **中间只读步骤保持聊天流干净**：嵌入面板后、最终回复或调用 `exit_plan_mode` 之前的所有中间步骤，**不要在聊天框外散落过程文字**，直接调用只读工具即可；执行 `run_command` 时在 `toolSummary` 中填写简练中文摘要，Hook 会自动聚合进面板的折叠工具链中。
+     3. **收尾或移交执行（`exit_plan_mode`）**：
+        - 若为纯排查/问答、无需修改代码：最后一轮纯文本直接输出完整结论即可，`Stop` Hook 会自动将面板中的默认任务全部标为 `"completed"` 并折叠成单行完成条；
+        - 若需调用 `exit_plan_mode` 移交执行模型：在 `plan` 中明确注明“本轮已挂载的任务进度面板为 `<Artifact Directory Path>/<本轮文件名>`，执行阶段**切勿再输出新的 `<agent-embed>`**，请直接用 `edit_file` 更新该文件中的 `"logs"` 与 `"tasks"`（带上 `ArtifactMetadata: { Summary: "任务进度面板", UserFacing: false, RequestFeedback: false }`），全部验证完成后将 `"tasks"` 全部设为 `"completed"` 再输出最终总结”。
+   - **Hook 自动兜底提醒衔接**：若某轮未在首步主动嵌入 `<agent-embed>`，收到 Hook 系统消息提示“任务进度面板槽位 `task-hud-t<K>.html` 已就绪，但当前对话界面尚未嵌入该面板”时：
+     - 若后续仍需继续调用工具，在下一轮回复中补发唯一一次该槽位的 `<agent-embed>` 并同时发起业务工具调用；
+     - 若已准备直接给出最终回答，则无需再嵌入（Hook 会在本轮结束后自动清理未嵌入的空跑槽位）。

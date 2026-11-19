@@ -1,12 +1,18 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import {
+  advanceAutoSeededHudForPlanHandover,
   classifyTool,
+  clearAutoSeededHudSlot,
+  collapseArtifactHudFile,
   createEmptyStats,
   ensureArtifactHudTemplate,
+  finalizeActiveTurn,
   findNextAvailableTurnSlot,
   formatDuration,
   isHudInternalTool,
+  isHudSlotCollapsedFile,
+  isTurnInterrupted,
   loadConversationState,
   loadSettings,
   normalizeAndAdvanceTasks,
@@ -23,6 +29,8 @@ import {
   summarizeToolStats,
   syncArtifactHudFile,
 } from './state-store.mjs';
+
+const WRITE_TOOLS = new Set(['edit_file', 'write_file', 'replace_file_content']);
 
 function readStdinText() {
   return new Promise((resolve) => {
@@ -45,14 +53,27 @@ function resolveCompactTranscriptPath(transcriptPath) {
 
 function inspectTranscript(transcriptPath) {
   const target = resolveCompactTranscriptPath(transcriptPath);
-  if (!target) return { latestUser: null, latestHud: null, activeHudFile: '', usedSlots: [], lastPlannerText: '' };
+  if (!target) {
+    return {
+      latestUser: null,
+      latestHud: null,
+      activeHudFile: '',
+      embeddedHudFile: '',
+      usedSlots: [],
+      lastPlannerText: '',
+      lastToolNames: [],
+      hasPlannerAfterLatestUser: false,
+    };
+  }
   try {
     const raw = readFileSync(target, 'utf-8');
     const lines = raw.trim().split('\n');
     let latestUser = null;
     let latestHud = null;
     let activeHudFile = '';
+    let embeddedHudFile = '';
     let lastPlannerText = '';
+    let lastToolNames = [];
     let sawLastPlanner = false;
     const usedSlots = [];
 
@@ -73,12 +94,17 @@ function inspectTranscript(transcriptPath) {
           if (!sawLastPlanner) {
             sawLastPlanner = true;
             lastPlannerText = typeof obj?.content === 'string' ? obj.content : '';
+            lastToolNames = Array.isArray(obj.tool_calls)
+              ? obj.tool_calls.map((tc) => String(tc?.name || '').toLowerCase()).filter(Boolean)
+              : [];
           }
           if (typeof obj?.content === 'string') {
-            const matches = [...obj.content.matchAll(/task-hud(?:-t\d+|-\d+|-end)?\.html/gi)];
+            const embedRe = /<agent-embed\b[^>]*\bsrc=["'][^"']*?(task-hud(?:-t\d+|-\d+|-end)?\.html)["'][^>]*>/gi;
+            const matches = [...obj.content.matchAll(embedRe)];
             for (let mIdx = matches.length - 1; mIdx >= 0; mIdx--) {
-              const slotName = normalizeHudFileName(matches[mIdx][0]);
+              const slotName = normalizeHudFileName(matches[mIdx][1]);
               if (slotName) {
+                if (!embeddedHudFile) embeddedHudFile = slotName;
                 if (!activeHudFile) activeHudFile = slotName;
                 if (!usedSlots.includes(slotName)) {
                   usedSlots.unshift(slotName);
@@ -89,6 +115,8 @@ function inspectTranscript(transcriptPath) {
           if (Array.isArray(obj.tool_calls)) {
             for (let tIdx = obj.tool_calls.length - 1; tIdx >= 0; tIdx--) {
               const tc = obj.tool_calls[tIdx];
+              const tcName = String(tc?.name || '').toLowerCase();
+              if (!WRITE_TOOLS.has(tcName)) continue;
               const args = normalizeToolArgs(tc?.args);
               const candidate = normalizeHudFileName(args.Path || args.path || args.TargetFile || '');
               if (candidate) {
@@ -112,13 +140,33 @@ function inspectTranscript(transcriptPath) {
         latestUser = {
           stepIndex: Number(obj.step_index),
           createdMs: Number.isFinite(createdMs) ? createdMs : null,
+          userInput: cleanUserText(obj.content),
+          fingerprint: buildUserInputFingerprint(obj.content, obj.media),
         };
         break;
       }
     }
-    return { latestUser, latestHud, activeHudFile, usedSlots, lastPlannerText };
+    return {
+      latestUser,
+      latestHud,
+      activeHudFile,
+      embeddedHudFile,
+      usedSlots,
+      lastPlannerText,
+      lastToolNames,
+      hasPlannerAfterLatestUser: sawLastPlanner,
+    };
   } catch {
-    return { latestUser: null, latestHud: null, activeHudFile: '', usedSlots: [], lastPlannerText: '' };
+    return {
+      latestUser: null,
+      latestHud: null,
+      activeHudFile: '',
+      embeddedHudFile: '',
+      usedSlots: [],
+      lastPlannerText: '',
+      lastToolNames: [],
+      hasPlannerAfterLatestUser: false,
+    };
   }
 }
 
@@ -152,46 +200,195 @@ function cleanUserText(raw) {
   return body.replace(/\s+/g, ' ').trim().slice(0, 140);
 }
 
-function finalizeActiveTurn(state, { terminationReason = 'NO_TOOL_CALL', now = Date.now() } = {}) {
-  if (!state.activeTurn) return null;
-  const t = state.activeTurn;
-  const endedAt = Math.max(now, t.startedAt || now);
-  const completed = {
-    turnIndex: t.turnIndex,
-    userStepIndex: t.userStepIndex ?? null,
-    userInput: t.userInput || '',
-    hudFileName: t.hudFileName || '',
-    startedAt: t.startedAt,
-    endedAt,
-    elapsedMs: endedAt - t.startedAt,
-    terminationReason,
-    stats: t.stats || createEmptyStats(),
-    announcedInChat: false,
-  };
+function buildUserInputFingerprint(raw, media = []) {
+  const s = String(raw || '');
+  const reqMatch = s.match(/<USER_REQUEST>\s*([\s\S]*?)\s*<\/USER_REQUEST>/i);
+  const bodyRaw = reqMatch
+    ? reqMatch[1]
+    : s.replace(/<ADDITIONAL_METADATA>[\s\S]*?<\/ADDITIONAL_METADATA>/gi, '');
+  const text = bodyRaw.replace(/\s+/g, ' ').trim();
 
-  const lastIdx = state.turns.length - 1;
-  if (
-    lastIdx >= 0 &&
-    completed.userStepIndex !== null &&
-    state.turns[lastIdx].userStepIndex === completed.userStepIndex
+  const fileSet = new Set();
+  const metaMatch = s.match(/<ADDITIONAL_METADATA>([\s\S]*?)<\/ADDITIONAL_METADATA>/i);
+  if (metaMatch) {
+    const fileRe = /^\s*-\s+(.+?\.\w+)\s*$/gm;
+    for (const m of metaMatch[1].matchAll(fileRe)) {
+      const p = String(m[1] || '').trim().replace(/\\/g, '/');
+      if (p) fileSet.add(p);
+    }
+  }
+  if (Array.isArray(media)) {
+    for (const item of media) {
+      const uri = String(item?.uri || item?.path || '').trim().replace(/\\/g, '/');
+      if (uri) fileSet.add(uri);
+    }
+  }
+  const files = [...fileSet].sort();
+  if (!text && files.length === 0) return '';
+  return JSON.stringify({ text, files });
+}
+
+function pickUsableHudFile(artifactDir, ...candidates) {
+  for (const c of candidates) {
+    const norm = normalizeHudFileName(c);
+    if (!norm) continue;
+    if (artifactDir && isHudSlotCollapsedFile(artifactDir, norm)) continue;
+    return norm;
+  }
+  return '';
+}
+
+function collapseSupersededTurnHud(state, turn, now = Date.now()) {
+  if (!turn?.hudFileName || turn.hudCollapsed || !state.artifactDirectoryPath) return false;
+  const ok = collapseArtifactHudFile(state.artifactDirectoryPath, turn.hudFileName, { now, turn });
+  if (ok) {
+    turn.hudCollapsed = true;
+  }
+  return ok;
+}
+
+function rotateToNewTurn(
+  state,
+  {
+    latestUser = null,
+    userText = '',
+    userFingerprint = '',
+    payloadFingerprint = '',
+    embeddedHudFile = '',
+    activeHudFile = '',
+    now = Date.now(),
+  } = {}
+) {
+  const prevUserStepIndex = state.activeTurn?.userStepIndex ?? null;
+  if (state.activeTurn) {
+    const prevTurn = finalizeActiveTurn(state, { terminationReason: 'TURN_REPLACED', now });
+    collapseSupersededTurnHud(state, prevTurn, now);
+  } else if (
+    isTurnInterrupted(state.lastCompletedTurn) &&
+    state.lastCompletedTurn?.terminationReason !== 'USER_CANCELED'
   ) {
-    const prev = state.turns[lastIdx];
-    const startedAt = Math.min(prev.startedAt || completed.startedAt, completed.startedAt);
-    completed.turnIndex = prev.turnIndex;
-    completed.hudFileName = completed.hudFileName || prev.hudFileName || '';
-    completed.startedAt = startedAt;
-    completed.elapsedMs = Math.max(0, endedAt - startedAt);
-    state.turns[lastIdx] = completed;
+    collapseSupersededTurnHud(state, state.lastCompletedTurn, now);
+  }
+
+  state.taskTitle = '';
+  state.summary = '';
+  state.logs = [];
+  state.tasks = [];
+  if (state.artifactDirectoryPath) {
+    resetArtifactHudSlots(state.artifactDirectoryPath);
+  }
+
+  let nextUserStepIndex = null;
+  let minUserStepIndex = null;
+  if (latestUser && latestUser.stepIndex !== prevUserStepIndex) {
+    nextUserStepIndex = latestUser.stepIndex;
   } else {
-    state.turns.push(completed);
-    if (state.turns.length > 50) {
-      state.turns = state.turns.slice(-50);
+    minUserStepIndex = prevUserStepIndex;
+  }
+
+  const nextIndex = (state.turns[state.turns.length - 1]?.turnIndex || 0) + 1;
+  let startedAt = now;
+  if (
+    nextUserStepIndex !== null &&
+    latestUser?.createdMs &&
+    now - latestUser.createdMs >= 0 &&
+    now - latestUser.createdMs <= 120000
+  ) {
+    startedAt = latestUser.createdMs;
+  }
+
+  const usableEmbedded = pickUsableHudFile(state.artifactDirectoryPath, embeddedHudFile);
+  const usableActive = pickUsableHudFile(state.artifactDirectoryPath, activeHudFile);
+  const resolvedHud = usableEmbedded || usableActive || '';
+
+  state.activeTurn = {
+    turnIndex: nextIndex,
+    userStepIndex: nextUserStepIndex,
+    minUserStepIndex,
+    userInput: userText || (nextUserStepIndex !== null ? latestUser?.userInput || '' : ''),
+    userFingerprint: userFingerprint || (nextUserStepIndex !== null ? latestUser?.fingerprint || '' : ''),
+    payloadFingerprint,
+    hudFileName: resolvedHud,
+    hasUserEmbed: Boolean(usableEmbedded),
+    autoEmbedInjected: false,
+    autoSeededSlot: '',
+    supersededCollapsed: false,
+    startedAt,
+    invocationCount: 1,
+    stats: createEmptyStats(),
+    recentTools: [],
+    lastAnnouncedToolCount: 0,
+  };
+  return state.activeTurn;
+}
+
+function reconcileTurnWithTranscript(state, tInfo, payload, now = Date.now()) {
+  const { latestUser, embeddedHudFile, activeHudFile, hasPlannerAfterLatestUser } = tInfo;
+  if (state.activeTurn && state.activeTurn.userStepIndex === null && latestUser) {
+    if (
+      state.activeTurn.minUserStepIndex === null ||
+      state.activeTurn.minUserStepIndex === undefined ||
+      latestUser.stepIndex > state.activeTurn.minUserStepIndex
+    ) {
+      state.activeTurn.userStepIndex = latestUser.stepIndex;
+      state.activeTurn.minUserStepIndex = null;
+      if (!state.activeTurn.userInput && latestUser.userInput) {
+        state.activeTurn.userInput = latestUser.userInput;
+      }
+      if (!state.activeTurn.userFingerprint && latestUser.fingerprint) {
+        state.activeTurn.userFingerprint = latestUser.fingerprint;
+      }
     }
   }
 
-  state.lastCompletedTurn = completed;
-  state.activeTurn = null;
-  return completed;
+  const hasNewerUser = Boolean(
+    latestUser &&
+      state.activeTurn &&
+      state.activeTurn.userStepIndex !== null &&
+      latestUser.stepIndex > state.activeTurn.userStepIndex
+  );
+
+  if (hasNewerUser) {
+    if (hasPlannerAfterLatestUser) {
+      const payloadFp = buildUserInputFingerprint(payload?.lastUserInput);
+      rotateToNewTurn(state, {
+        latestUser,
+        userText: latestUser.userInput || cleanUserText(payload?.lastUserInput),
+        userFingerprint: latestUser.fingerprint || payloadFp,
+        payloadFingerprint: payloadFp,
+        embeddedHudFile,
+        activeHudFile,
+        now,
+      });
+      return { isStaleInFlight: false, rotated: true };
+    }
+
+    if (!state.activeTurn.supersededCollapsed && state.activeTurn.hudFileName && state.artifactDirectoryPath) {
+      collapseArtifactHudFile(state.artifactDirectoryPath, state.activeTurn.hudFileName, {
+        now,
+        turn: state.activeTurn,
+      });
+      state.activeTurn.supersededCollapsed = true;
+    }
+    return { isStaleInFlight: true, rotated: false };
+  }
+
+  if (
+    embeddedHudFile &&
+    state.activeTurn?.hudFileName &&
+    embeddedHudFile !== state.activeTurn.hudFileName &&
+    !isHudSlotCollapsedFile(state.artifactDirectoryPath, embeddedHudFile)
+  ) {
+    collapseArtifactHudFile(state.artifactDirectoryPath, state.activeTurn.hudFileName, {
+      now,
+      turn: state.activeTurn,
+    });
+    state.activeTurn.hudFileName = embeddedHudFile;
+    state.activeTurn.hasUserEmbed = true;
+    state.activeTurn.autoSeededSlot = '';
+  }
+
+  return { isStaleInFlight: false, rotated: false };
 }
 
 function handleSessionStart(payload, state) {
@@ -210,14 +407,18 @@ function handlePreInvocation(payload, state, settings) {
     state.artifactDirectoryPath = payload.artifactDirectoryPath;
     ensureArtifactHudTemplate(state.artifactDirectoryPath);
   }
-  const { latestUser, latestHud, activeHudFile } = inspectTranscript(state.transcriptPath);
+  const { latestUser, latestHud, activeHudFile, embeddedHudFile } = inspectTranscript(state.transcriptPath);
 
   const userText = cleanUserText(payload.lastUserInput);
+  const payloadFingerprint = buildUserInputFingerprint(payload.lastUserInput);
+  const userFingerprint = latestUser?.fingerprint || payloadFingerprint;
 
   if (
     !state.activeTurn &&
     latestUser &&
     state.lastCompletedTurn &&
+    !state.lastCompletedTurn.hudCollapsed &&
+    !isTurnInterrupted(state.lastCompletedTurn) &&
     state.lastCompletedTurn.userStepIndex !== null &&
     state.lastCompletedTurn.userStepIndex === latestUser.stepIndex
   ) {
@@ -225,8 +426,15 @@ function handlePreInvocation(payload, state, settings) {
     state.activeTurn = {
       turnIndex: resumed.turnIndex,
       userStepIndex: resumed.userStepIndex,
+      minUserStepIndex: null,
       userInput: resumed.userInput || userText,
-      hudFileName: resumed.hudFileName || activeHudFile || '',
+      userFingerprint: resumed.userFingerprint || userFingerprint,
+      payloadFingerprint: resumed.payloadFingerprint || payloadFingerprint,
+      hudFileName: resumed.hudFileName || pickUsableHudFile(state.artifactDirectoryPath, activeHudFile) || '',
+      hasUserEmbed: Boolean(resumed.hasUserEmbed || embeddedHudFile),
+      autoEmbedInjected: Boolean(resumed.autoEmbedInjected),
+      autoSeededSlot: resumed.autoSeededSlot || '',
+      supersededCollapsed: false,
       startedAt: resumed.startedAt || now,
       invocationCount: 2,
       stats: resumed.stats || createEmptyStats(),
@@ -236,42 +444,72 @@ function handlePreInvocation(payload, state, settings) {
     state.lastCompletedTurn = state.turns[state.turns.length - 1] || null;
   }
 
+  if (state.activeTurn && state.activeTurn.userStepIndex === null && latestUser) {
+    if (
+      state.activeTurn.minUserStepIndex === null ||
+      state.activeTurn.minUserStepIndex === undefined ||
+      latestUser.stepIndex > state.activeTurn.minUserStepIndex
+    ) {
+      state.activeTurn.userStepIndex = latestUser.stepIndex;
+      state.activeTurn.minUserStepIndex = null;
+    }
+  }
+
+  const hasNewerUserStep = Boolean(
+    latestUser &&
+      state.activeTurn &&
+      state.activeTurn.userStepIndex !== null &&
+      latestUser.stepIndex > state.activeTurn.userStepIndex
+  );
+  const hasDifferentPayload = Boolean(
+    payloadFingerprint &&
+      state.activeTurn?.payloadFingerprint &&
+      payloadFingerprint !== state.activeTurn.payloadFingerprint
+  );
+
   const isNewTurn =
     !state.activeTurn ||
-    (latestUser && state.activeTurn.userStepIndex !== null && latestUser.stepIndex !== state.activeTurn.userStepIndex) ||
+    hasNewerUserStep ||
+    hasDifferentPayload ||
     (!latestUser && userText && state.activeTurn.userInput && userText !== state.activeTurn.userInput);
 
   if (isNewTurn) {
-    if (state.activeTurn) {
-      finalizeActiveTurn(state, { terminationReason: 'TURN_REPLACED', now });
-    }
-    state.taskTitle = '';
-    state.summary = '';
-    state.logs = [];
-    state.tasks = [];
-    if (state.artifactDirectoryPath) {
-      resetArtifactHudSlots(state.artifactDirectoryPath);
-    }
-    const nextIndex = (state.turns[state.turns.length - 1]?.turnIndex || 0) + 1;
-    let startedAt = now;
-    if (latestUser?.createdMs && now - latestUser.createdMs >= 0 && now - latestUser.createdMs <= 120000) {
-      startedAt = latestUser.createdMs;
-    }
-    state.activeTurn = {
-      turnIndex: nextIndex,
-      userStepIndex: latestUser ? latestUser.stepIndex : null,
-      userInput: userText,
-      hudFileName: activeHudFile || '',
-      startedAt,
-      invocationCount: 1,
-      stats: createEmptyStats(),
-      recentTools: [],
-      lastAnnouncedToolCount: 0,
-    };
+    rotateToNewTurn(state, {
+      latestUser,
+      userText,
+      userFingerprint,
+      payloadFingerprint,
+      embeddedHudFile,
+      activeHudFile,
+      now,
+    });
   } else {
     state.activeTurn.invocationCount = (state.activeTurn.invocationCount || 0) + 1;
-    if (!state.activeTurn.hudFileName && activeHudFile) {
-      state.activeTurn.hudFileName = activeHudFile;
+    if (payloadFingerprint && !state.activeTurn.payloadFingerprint) {
+      state.activeTurn.payloadFingerprint = payloadFingerprint;
+    }
+    if (userFingerprint && !state.activeTurn.userFingerprint) {
+      state.activeTurn.userFingerprint = userFingerprint;
+    }
+    const usableEmbedded = pickUsableHudFile(state.artifactDirectoryPath, embeddedHudFile);
+    const usableActive = pickUsableHudFile(state.artifactDirectoryPath, activeHudFile);
+    if (
+      usableEmbedded &&
+      state.activeTurn.hudFileName &&
+      usableEmbedded !== state.activeTurn.hudFileName
+    ) {
+      collapseArtifactHudFile(state.artifactDirectoryPath, state.activeTurn.hudFileName, {
+        now,
+        turn: state.activeTurn,
+      });
+      state.activeTurn.hudFileName = usableEmbedded;
+      state.activeTurn.autoSeededSlot = '';
+    }
+    if (usableEmbedded) {
+      state.activeTurn.hasUserEmbed = true;
+    }
+    if (!state.activeTurn.hudFileName && (usableEmbedded || usableActive)) {
+      state.activeTurn.hudFileName = usableEmbedded || usableActive;
     }
     applyParsedHudToState(state, latestHud, {
       turnFinished: false,
@@ -292,63 +530,192 @@ function handlePreInvocation(payload, state, settings) {
   return {};
 }
 
-function handlePreToolUse(payload) {
-  const toolName = String(payload.toolCall?.name || '').toLowerCase();
+function defaultPreToolUseOutput(payload) {
+  const toolName = String(payload?.toolCall?.name || '').toLowerCase();
   if (toolName === 'run_command') {
     return { decision: 'ask' };
   }
   return { decision: 'allow' };
 }
 
+function handlePreToolUse(payload, state) {
+  const decisionOutput = defaultPreToolUseOutput(payload);
+  try {
+    if (!state || typeof state !== 'object') {
+      return decisionOutput;
+    }
+    const tool = payload.toolCall || {};
+    const toolName = String(tool.name || '').toLowerCase();
+    const normArgs = normalizeToolArgs(tool.args && typeof tool.args === 'object' ? tool.args : {});
+    const now = Date.now();
+    if (payload.transcriptPath) state.transcriptPath = payload.transcriptPath;
+    if (payload.artifactDirectoryPath) state.artifactDirectoryPath = payload.artifactDirectoryPath;
+
+    if (!isHudInternalTool(toolName, normArgs)) {
+      const tInfo = inspectTranscript(state.transcriptPath);
+      const { isStaleInFlight } = reconcileTurnWithTranscript(state, tInfo, payload, now);
+      if (!isStaleInFlight) {
+        const { latestUser, latestHud, embeddedHudFile } = tInfo;
+        const usableEmbedded = pickUsableHudFile(state.artifactDirectoryPath, embeddedHudFile);
+        if (usableEmbedded && state.artifactDirectoryPath) {
+          if (!state.activeTurn) {
+            const payloadFp = buildUserInputFingerprint(payload.lastUserInput);
+            state.activeTurn = rotateToNewTurn(state, {
+              latestUser,
+              userText: cleanUserText(payload.lastUserInput),
+              userFingerprint: latestUser?.fingerprint || payloadFp,
+              payloadFingerprint: payloadFp,
+              embeddedHudFile: usableEmbedded,
+              now,
+            });
+          } else {
+            state.activeTurn.hudFileName = usableEmbedded;
+            state.activeTurn.hasUserEmbed = true;
+          }
+          const seeded = seedDefaultHudTasksIfEmpty(state.artifactDirectoryPath, usableEmbedded, {
+            userInput: state.activeTurn.userInput,
+          });
+          if (seeded) {
+            state.activeTurn.autoSeededSlot = usableEmbedded;
+          }
+          applyParsedHudToState(state, latestHud, {
+            turnFinished: false,
+            now,
+            preferredFileName: usableEmbedded,
+          });
+          syncArtifactHudFile(state.artifactDirectoryPath, state, {
+            turnFinished: false,
+            now,
+            isPreToolUse: true,
+            targetFileName: usableEmbedded,
+          });
+        }
+
+        if (toolName === 'exit_plan_mode' && state.activeTurn?.hudFileName && state.artifactDirectoryPath) {
+          advanceAutoSeededHudForPlanHandover(state.artifactDirectoryPath, state.activeTurn.hudFileName);
+          applyParsedHudToState(state, latestHud, {
+            turnFinished: false,
+            now,
+            preferredFileName: state.activeTurn.hudFileName,
+          });
+          syncArtifactHudFile(state.artifactDirectoryPath, state, {
+            turnFinished: false,
+            now,
+            isPreToolUse: true,
+            targetFileName: state.activeTurn.hudFileName,
+          });
+        }
+      }
+    }
+  } catch {
+    // 防自锁兜底：PreToolUse 同步失败时仍返回标准工具决策，避免阻断模型调用任何工具
+  }
+
+  return decisionOutput;
+}
+
 function handlePostToolUse(payload, state) {
   const tool = payload.toolCall || {};
   const toolName = String(tool.name || '');
+  const lowerName = toolName.toLowerCase();
   const toolArgs = tool.args && typeof tool.args === 'object' ? tool.args : {};
   const normArgs = normalizeToolArgs(toolArgs);
   const now = Date.now();
   if (payload.transcriptPath) state.transcriptPath = payload.transcriptPath;
   if (payload.artifactDirectoryPath) state.artifactDirectoryPath = payload.artifactDirectoryPath;
 
-  const { latestUser, latestHud, activeHudFile } = inspectTranscript(state.transcriptPath);
-  const isStaleTool =
-    latestUser &&
-    state.activeTurn &&
-    state.activeTurn.userStepIndex !== null &&
-    latestUser.stepIndex !== state.activeTurn.userStepIndex;
+  const tInfo = inspectTranscript(state.transcriptPath);
+  const { isStaleInFlight } = reconcileTurnWithTranscript(state, tInfo, payload, now);
+  const { latestUser, latestHud, activeHudFile, embeddedHudFile } = tInfo;
 
-  const hitHudFile = normalizeHudFileName(normArgs.Path || normArgs.path || normArgs.TargetFile || '');
-
-  if (!isStaleTool) {
-    const resolvedHud = hitHudFile || state.activeTurn?.hudFileName || activeHudFile || '';
-    if (!state.activeTurn) {
-      const nextIndex = (state.turns[state.turns.length - 1]?.turnIndex || 0) + 1;
-      state.activeTurn = {
-        turnIndex: nextIndex,
-        userStepIndex: latestUser ? latestUser.stepIndex : null,
-        userInput: cleanUserText(payload.lastUserInput),
-        hudFileName: resolvedHud,
-        startedAt: now,
-        invocationCount: 1,
-        stats: createEmptyStats(),
-        recentTools: [],
-      };
-    } else if (hitHudFile) {
-      state.activeTurn.hudFileName = hitHudFile;
-    } else if (!state.activeTurn.hudFileName && activeHudFile) {
-      state.activeTurn.hudFileName = activeHudFile;
+  if (isStaleInFlight) {
+    if (isHudInternalTool(toolName, normArgs)) {
+      return {};
     }
+    if (state.activeTurn) {
+      const info = classifyTool(toolName, normArgs);
+      const stats = state.activeTurn.stats || createEmptyStats();
+      stats[info.category] = (stats[info.category] || 0) + 1;
+      stats.totalTools = (stats.totalTools || 0) + 1;
+      if (payload.error) {
+        stats.failures = (stats.failures || 0) + 1;
+      }
+      state.activeTurn.stats = stats;
+    }
+    return {};
+  }
 
-    if (resolvedHud) {
-      applyParsedHudToState(state, latestHud, {
-        turnFinished: false,
-        now,
-        preferredFileName: resolvedHud,
-      });
+  const hitHudFile = WRITE_TOOLS.has(lowerName)
+    ? normalizeHudFileName(normArgs.Path || normArgs.path || normArgs.TargetFile || '')
+    : '';
+  const usableHitHud = pickUsableHudFile(state.artifactDirectoryPath, hitHudFile);
+  const usableEmbedded = pickUsableHudFile(state.artifactDirectoryPath, embeddedHudFile);
+  const usableActive = pickUsableHudFile(state.artifactDirectoryPath, activeHudFile);
+  const resolvedHud = usableHitHud || usableEmbedded || state.activeTurn?.hudFileName || usableActive || '';
+
+  if (!state.activeTurn) {
+    const payloadFp = buildUserInputFingerprint(payload.lastUserInput);
+    state.activeTurn = rotateToNewTurn(state, {
+      latestUser,
+      userText: cleanUserText(payload.lastUserInput),
+      userFingerprint: latestUser?.fingerprint || payloadFp,
+      payloadFingerprint: payloadFp,
+      embeddedHudFile: usableEmbedded,
+      activeHudFile: resolvedHud,
+      now,
+    });
+    if (usableHitHud) {
+      state.activeTurn.hudFileName = usableHitHud;
+      state.activeTurn.autoSeededSlot = '';
+    }
+  } else {
+    if (usableEmbedded) {
+      state.activeTurn.hasUserEmbed = true;
+    }
+    if (usableHitHud) {
+      if (state.activeTurn.hudFileName && state.activeTurn.hudFileName !== usableHitHud) {
+        collapseArtifactHudFile(state.artifactDirectoryPath, state.activeTurn.hudFileName, {
+          now,
+          turn: state.activeTurn,
+        });
+      }
+      state.activeTurn.hudFileName = usableHitHud;
+      state.activeTurn.autoSeededSlot = '';
+    } else if (usableEmbedded && !state.activeTurn.hudFileName) {
+      state.activeTurn.hudFileName = usableEmbedded;
+    } else if (!state.activeTurn.hudFileName && usableActive) {
+      state.activeTurn.hudFileName = usableActive;
     }
   }
 
+  if (
+    resolvedHud &&
+    state.artifactDirectoryPath &&
+    !isHudInternalTool(toolName, normArgs) &&
+    !parseArtifactHudHtml(state.artifactDirectoryPath, now, resolvedHud)
+  ) {
+    const seeded = seedDefaultHudTasksIfEmpty(state.artifactDirectoryPath, resolvedHud, {
+      userInput: state.activeTurn.userInput,
+    });
+    if (seeded) {
+      state.activeTurn.autoSeededSlot = resolvedHud;
+    }
+  }
+
+  if (lowerName === 'exit_plan_mode' && state.activeTurn?.hudFileName && state.artifactDirectoryPath) {
+    advanceAutoSeededHudForPlanHandover(state.artifactDirectoryPath, state.activeTurn.hudFileName);
+  }
+
+  if (resolvedHud) {
+    applyParsedHudToState(state, latestHud, {
+      turnFinished: false,
+      now,
+      preferredFileName: resolvedHud,
+    });
+  }
+
   if (isHudInternalTool(toolName, normArgs)) {
-    if (!isStaleTool && state.activeTurn?.hudFileName) {
+    if (state.activeTurn?.hudFileName) {
       syncArtifactHudFile(state.artifactDirectoryPath, state, {
         turnFinished: false,
         now,
@@ -358,19 +725,6 @@ function handlePostToolUse(payload, state) {
     return {};
   }
 
-  if (!state.activeTurn) {
-    const nextIndex = (state.turns[state.turns.length - 1]?.turnIndex || 0) + 1;
-    state.activeTurn = {
-      turnIndex: nextIndex,
-      userStepIndex: latestUser ? latestUser.stepIndex : null,
-      userInput: cleanUserText(payload.lastUserInput),
-      hudFileName: (!isStaleTool && activeHudFile) ? activeHudFile : '',
-      startedAt: now,
-      invocationCount: 1,
-      stats: createEmptyStats(),
-      recentTools: [],
-    };
-  }
   const info = classifyTool(toolName, normArgs);
   const stats = state.activeTurn.stats || createEmptyStats();
   stats[info.category] = (stats[info.category] || 0) + 1;
@@ -405,34 +759,47 @@ function handlePostInvocation(payload, state) {
   if (payload.transcriptPath) state.transcriptPath = payload.transcriptPath;
   if (payload.artifactDirectoryPath) state.artifactDirectoryPath = payload.artifactDirectoryPath;
 
-  const { latestUser, latestHud, activeHudFile } = inspectTranscript(state.transcriptPath);
-  const isStale =
-    latestUser &&
-    state.activeTurn &&
-    state.activeTurn.userStepIndex !== null &&
-    latestUser.stepIndex !== state.activeTurn.userStepIndex;
-
-  if (!isStale && state.activeTurn && !state.activeTurn.hudFileName && activeHudFile) {
-    state.activeTurn.hudFileName = activeHudFile;
+  const tInfo = inspectTranscript(state.transcriptPath);
+  const { isStaleInFlight } = reconcileTurnWithTranscript(state, tInfo, payload, now);
+  if (isStaleInFlight) {
+    return {};
   }
 
-  let targetFileName = state.activeTurn?.hudFileName || (!isStale ? activeHudFile : '') || '';
+  const { latestHud, activeHudFile, embeddedHudFile, lastToolNames } = tInfo;
+  const usableEmbedded = pickUsableHudFile(state.artifactDirectoryPath, embeddedHudFile);
+  const usableActive = pickUsableHudFile(state.artifactDirectoryPath, activeHudFile);
+
+  if (state.activeTurn) {
+    if (usableEmbedded) {
+      state.activeTurn.hasUserEmbed = true;
+    }
+    if (!state.activeTurn.hudFileName && (usableEmbedded || usableActive)) {
+      state.activeTurn.hudFileName = usableEmbedded || usableActive;
+    }
+  }
+
+  let targetFileName = state.activeTurn?.hudFileName || usableEmbedded || usableActive || '';
   let injectedOutput = null;
 
-  // 若模型处于只读 Plan mode（如 Orchestrator）无法调用 edit_file，或首轮执行业务工具时未主动写入/嵌入面板，则由 Hook 自动分配槽位并兜底注入
+  // 若处于只读 Plan mode（如 Orchestrator）或模型执行工具后尚未主动输出 <agent-embed>，
+  // 由 Hook 分配并初始化槽位，并通过纯文本 systemMessage 提示模型在需要继续调用工具时补嵌（禁止附带 metadata 以防宿主 protobuf reflect panic）
   if (
-    !isStale &&
     state.artifactDirectoryPath &&
     state.activeTurn &&
-    !targetFileName &&
+    !usableEmbedded &&
+    !state.activeTurn.hasUserEmbed &&
     !state.activeTurn.autoEmbedInjected &&
+    !lastToolNames.includes('exit_plan_mode') &&
     Number(state.activeTurn.stats?.totalTools || 0) >= 1
   ) {
-    const autoSlot = findNextAvailableTurnSlot(state.artifactDirectoryPath, state);
+    const autoSlot = targetFileName || findNextAvailableTurnSlot(state.artifactDirectoryPath, state);
     if (autoSlot) {
-      seedDefaultHudTasksIfEmpty(state.artifactDirectoryPath, autoSlot, {
+      const seeded = seedDefaultHudTasksIfEmpty(state.artifactDirectoryPath, autoSlot, {
         userInput: state.activeTurn.userInput,
       });
+      if (seeded) {
+        state.activeTurn.autoSeededSlot = autoSlot;
+      }
       state.activeTurn.hudFileName = autoSlot;
       state.activeTurn.autoEmbedInjected = true;
       targetFileName = autoSlot;
@@ -442,10 +809,7 @@ function handlePostInvocation(payload, state) {
         injectSteps: [
           {
             systemMessage: {
-              systemMessage: `任务进度面板已由 Hook 自动挂载为 ${autoSlot}。请勿再额外输出或创建重复的 <agent-embed>；若当前环境具备 edit_file 权限，后续可直接更新 ${autoSlot} 中的 #task-hud-tasks（logs 与 tasks），并在任务完成时将其全部设为 completed。`,
-              metadata: {
-                user_markdown: `<agent-embed src="${fileUri}"></agent-embed>`,
-              },
+              systemMessage: `任务进度面板槽位 ${autoSlot} 已就绪，但当前对话界面尚未嵌入该面板。若后续仍需继续调用工具，请在下一轮回复中直接输出唯一一次 <agent-embed src="${fileUri}"></agent-embed>（标签外不要写过程文字）并同时发起下一步工具调用；若处于只读 Plan mode 无需调用 edit_file，Hook 会自动实时同步该面板的进度与计时；若已准备直接给出最终回答，则无需再嵌入。`,
             },
           },
         ],
@@ -474,24 +838,59 @@ function handleStop(payload, state) {
   if (payload.transcriptPath) state.transcriptPath = payload.transcriptPath;
   if (payload.artifactDirectoryPath) state.artifactDirectoryPath = payload.artifactDirectoryPath;
 
-  const { latestUser, latestHud, activeHudFile, lastPlannerText } = inspectTranscript(state.transcriptPath);
-  const fullyDone = payload.fullyIdle !== false && (payload.terminationReason || 'NO_TOOL_CALL') === 'NO_TOOL_CALL';
+  const { latestUser, latestHud, activeHudFile, embeddedHudFile, lastPlannerText, lastToolNames } = inspectTranscript(state.transcriptPath);
+  const termReason = payload.terminationReason || 'NO_TOOL_CALL';
+  const isPlanHandover =
+    lastToolNames.includes('exit_plan_mode') &&
+    termReason !== 'USER_CANCELED' &&
+    termReason !== 'ERROR';
+  const fullyDone =
+    payload.fullyIdle !== false &&
+    termReason === 'NO_TOOL_CALL' &&
+    !isPlanHandover;
 
-  const isStale =
+  if (state.activeTurn && state.activeTurn.userStepIndex === null && latestUser) {
+    if (
+      state.activeTurn.minUserStepIndex === null ||
+      state.activeTurn.minUserStepIndex === undefined ||
+      latestUser.stepIndex > state.activeTurn.minUserStepIndex
+    ) {
+      state.activeTurn.userStepIndex = latestUser.stepIndex;
+      state.activeTurn.minUserStepIndex = null;
+    }
+  }
+
+  const hasNewerUser = Boolean(
     latestUser &&
-    state.activeTurn &&
-    state.activeTurn.userStepIndex !== null &&
-    latestUser.stepIndex !== state.activeTurn.userStepIndex;
+      state.activeTurn &&
+      state.activeTurn.userStepIndex !== null &&
+      latestUser.stepIndex > state.activeTurn.userStepIndex
+  );
 
-  if (!isStale && state.activeTurn && !state.activeTurn.hudFileName && activeHudFile) {
-    state.activeTurn.hudFileName = activeHudFile;
+  if (hasNewerUser) {
+    if (state.activeTurn) {
+      const completed = finalizeActiveTurn(state, { terminationReason: 'TURN_REPLACED', now });
+      collapseSupersededTurnHud(state, completed, now);
+    }
+    return {};
+  }
+
+  const usableEmbedded = pickUsableHudFile(state.artifactDirectoryPath, embeddedHudFile);
+  const usableActive = pickUsableHudFile(state.artifactDirectoryPath, activeHudFile);
+
+  if (state.activeTurn) {
+    if (usableEmbedded) {
+      state.activeTurn.hasUserEmbed = true;
+    }
+    if (!state.activeTurn.hudFileName && (usableEmbedded || usableActive)) {
+      state.activeTurn.hudFileName = usableEmbedded || usableActive;
+    }
   }
 
   // 防提前中断兜底：若模型仅输出了 <agent-embed> 而未同时调用下一步业务工具，且任务尚未完成，则自动阻塞 Stop 并续跑 1 次
-  const preStopFile = state.activeTurn?.hudFileName || (!isStale ? activeHudFile : '') || '';
+  const preStopFile = state.activeTurn?.hudFileName || usableEmbedded || usableActive || '';
   if (
     fullyDone &&
-    !isStale &&
     !payload.continuationActive &&
     state.activeTurn &&
     !state.activeTurn.stopContinuedOnce &&
@@ -500,8 +899,17 @@ function handleStop(payload, state) {
     /<agent-embed\b/i.test(lastPlannerText) &&
     lastPlannerText.replace(/<agent-embed[\s\S]*?<\/agent-embed>/gi, '').trim() === ''
   ) {
-    const preParsed = parseArtifactHudHtml(state.artifactDirectoryPath, now, preStopFile);
-    const hasUnfinished = Boolean(preParsed?.tasks?.some((t) => t.status !== 'completed'));
+    let preParsed = parseArtifactHudHtml(state.artifactDirectoryPath, now, preStopFile);
+    if (!preParsed && state.artifactDirectoryPath) {
+      const seeded = seedDefaultHudTasksIfEmpty(state.artifactDirectoryPath, preStopFile, {
+        userInput: state.activeTurn.userInput,
+      });
+      if (seeded) {
+        state.activeTurn.autoSeededSlot = preStopFile;
+      }
+      preParsed = parseArtifactHudHtml(state.artifactDirectoryPath, now, preStopFile);
+    }
+    const hasUnfinished = !preParsed || Boolean(preParsed?.tasks?.some((t) => t.status !== 'completed'));
     if (hasUnfinished) {
       state.activeTurn.stopContinuedOnce = true;
       applyParsedHudToState(state, latestHud, {
@@ -521,42 +929,116 @@ function handleStop(payload, state) {
     }
   }
 
-  let completed = null;
-  if (state.activeTurn) {
-    completed = finalizeActiveTurn(state, {
-      terminationReason: payload.terminationReason || 'NO_TOOL_CALL',
-      now,
-    });
+  if (isPlanHandover && state.activeTurn?.hudFileName && state.artifactDirectoryPath) {
+    advanceAutoSeededHudForPlanHandover(state.artifactDirectoryPath, state.activeTurn.hudFileName);
   }
 
-  const targetFileName =
-    completed?.hudFileName ||
-    state.lastCompletedTurn?.hudFileName ||
-    (!isStale ? activeHudFile : '') ||
-    '';
+  let completed = null;
+  if (state.activeTurn && !isPlanHandover) {
+    completed = finalizeActiveTurn(state, {
+      terminationReason: termReason,
+      now,
+    });
+    if (!fullyDone && completed) {
+      completed.interrupted = true;
+    }
+  }
 
-  if (targetFileName) {
-    applyParsedHudToState(state, latestHud, {
-      turnFinished: fullyDone,
-      now,
-      preferredFileName: targetFileName,
-    });
-    syncArtifactHudFile(state.artifactDirectoryPath, state, {
-      turnFinished: fullyDone,
-      now,
-      targetFileName,
-    });
+  let cleanedOrphan = false;
+  if (
+    (fullyDone || termReason === 'USER_CANCELED') &&
+    !isPlanHandover &&
+    completed?.autoSeededSlot &&
+    !usableEmbedded &&
+    !completed?.hasUserEmbed
+  ) {
+    cleanedOrphan = clearAutoSeededHudSlot(state.artifactDirectoryPath, completed.autoSeededSlot);
+    if (cleanedOrphan) {
+      completed.hudFileName = '';
+      if (state.lastCompletedTurn === completed) {
+        state.lastCompletedTurn.hudFileName = '';
+      }
+      state.taskTitle = '';
+      state.summary = '';
+      state.logs = [];
+      state.tasks = [];
+    }
+  }
+
+  const sameTurnLastFile =
+    !state.activeTurn &&
+    !completed &&
+    state.lastCompletedTurn &&
+    !isTurnInterrupted(state.lastCompletedTurn) &&
+    !state.lastCompletedTurn.hudCollapsed &&
+    latestUser &&
+    state.lastCompletedTurn.userStepIndex === latestUser.stepIndex
+      ? state.lastCompletedTurn.hudFileName
+      : '';
+
+  const targetFileName = cleanedOrphan
+    ? ''
+    : state.activeTurn?.hudFileName ||
+      completed?.hudFileName ||
+      usableEmbedded ||
+      usableActive ||
+      sameTurnLastFile ||
+      '';
+
+  if (targetFileName && !completed?.hudCollapsed) {
+    if (!fullyDone && !isPlanHandover) {
+      applyParsedHudToState(state, latestHud, {
+        turnFinished: false,
+        now,
+        preferredFileName: targetFileName,
+      });
+      syncArtifactHudFile(state.artifactDirectoryPath, state, {
+        turnFinished: false,
+        turnInterrupted: true,
+        terminationReason: termReason,
+        now,
+        targetFileName,
+      });
+    } else {
+      applyParsedHudToState(state, latestHud, {
+        turnFinished: fullyDone,
+        now,
+        preferredFileName: targetFileName,
+      });
+      syncArtifactHudFile(state.artifactDirectoryPath, state, {
+        turnFinished: fullyDone,
+        now,
+        targetFileName,
+      });
+    }
+  }
+  return {};
+}
+
+let currentPayload = null;
+let currentRawInput = '';
+
+function fallbackOutputOnHookError(payload, rawInput = '') {
+  if (payload?.hookEventName === 'PreToolUse') {
+    return defaultPreToolUseOutput(payload);
+  }
+  if (/"hookEventName"\s*:\s*"PreToolUse"/.test(rawInput)) {
+    return {
+      decision: /"name"\s*:\s*"run_command"/i.test(rawInput) ? 'ask' : 'allow',
+    };
   }
   return {};
 }
 
 async function main() {
   const raw = await readStdinText();
+  currentRawInput = raw;
   let payload = {};
   try {
     payload = raw.trim() ? JSON.parse(raw) : {};
+    currentPayload = payload;
   } catch {
-    process.stdout.write('{}\n');
+    process.stdout.write(JSON.stringify(fallbackOutputOnHookError(null, raw)) + '\n');
     return;
   }
 
@@ -565,33 +1047,39 @@ async function main() {
   const eventName = String(payload.hookEventName || '');
 
   if (!convId) {
-    process.stdout.write('{}\n');
+    const out = eventName === 'PreToolUse' ? defaultPreToolUseOutput(payload) : {};
+    process.stdout.write(JSON.stringify(out) + '\n');
     return;
   }
 
-  recordActiveConversation(convId, { lastEvent: eventName }, dataDir);
-  const state = loadConversationState(convId, dataDir);
-  const settings = loadSettings(dataDir);
-
   let output = {};
-  if (eventName === 'SessionStart') {
-    output = handleSessionStart(payload, state);
-  } else if (eventName === 'PreInvocation') {
-    output = handlePreInvocation(payload, state, settings);
-  } else if (eventName === 'PreToolUse') {
-    output = handlePreToolUse(payload);
-  } else if (eventName === 'PostToolUse') {
-    output = handlePostToolUse(payload, state);
-  } else if (eventName === 'PostInvocation') {
-    output = handlePostInvocation(payload, state);
-  } else if (eventName === 'Stop') {
-    output = handleStop(payload, state);
+  try {
+    recordActiveConversation(convId, { lastEvent: eventName }, dataDir);
+    const state = loadConversationState(convId, dataDir);
+    const settings = loadSettings(dataDir);
+
+    if (eventName === 'SessionStart') {
+      output = handleSessionStart(payload, state);
+    } else if (eventName === 'PreInvocation') {
+      output = handlePreInvocation(payload, state, settings);
+    } else if (eventName === 'PreToolUse') {
+      output = handlePreToolUse(payload, state);
+    } else if (eventName === 'PostToolUse') {
+      output = handlePostToolUse(payload, state);
+    } else if (eventName === 'PostInvocation') {
+      output = handlePostInvocation(payload, state);
+    } else if (eventName === 'Stop') {
+      output = handleStop(payload, state);
+    }
+
+    saveConversationState(state, dataDir);
+  } catch {
+    output = eventName === 'PreToolUse' ? defaultPreToolUseOutput(payload) : {};
   }
 
-  saveConversationState(state, dataDir);
   process.stdout.write(JSON.stringify(output) + '\n');
 }
 
 main().catch(() => {
-  process.stdout.write('{}\n');
+  process.stdout.write(JSON.stringify(fallbackOutputOnHookError(currentPayload, currentRawInput)) + '\n');
 });
