@@ -438,7 +438,7 @@ function handleRpcMessage(msg) {
         result: {
           protocolVersion,
           capabilities: { tools: { listChanged: false } },
-          serverInfo: { name: 'task-hud-tasks', version: '1.3.0' },
+          serverInfo: { name: 'task-hud-tasks', version: '1.3.1' },
         },
       });
     }

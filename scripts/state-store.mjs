@@ -575,6 +575,8 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
   <style>
     *, *::before, *::after { box-sizing: border-box; }
     :root {
+      /* task-hud-font-v1 */
+      --hud-font-sans: var(--font-sans, var(--vscode-font-family, "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", -apple-system, BlinkMacSystemFont, Roboto, "PingFang SC", "PingFang TC", sans-serif));
       --hud-text-primary: #0b0b0b;
       --hud-text-secondary: #52514e;
       --hud-text-muted: #64748b;
@@ -605,7 +607,7 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
       padding: 0;
       background: transparent;
       color: var(--hud-text-primary);
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+      font-family: var(--hud-font-sans);
       font-size: 14px;
       line-height: 1.6;
       -webkit-font-smoothing: antialiased;
@@ -790,7 +792,7 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
       overflow: clip;
       overflow-wrap: break-word;
       color: var(--hud-text-primary);
-      font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "PingFang SC", "PingFang TC", sans-serif;
+      font-family: var(--hud-font-sans);
       font-size: 14px;
       line-height: 20px;
     }
@@ -890,7 +892,7 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
       box-shadow: inset 0 0 0 1px var(--hud-ring);
       overflow-wrap: break-word;
       color: var(--hud-text-secondary);
-      font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "PingFang SC", "PingFang TC", sans-serif;
+      font-family: var(--hud-font-sans);
       font-size: 14px;
       line-height: 20px;
       cursor: pointer;
@@ -1086,8 +1088,25 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
         btn.title = '面板主题：' + modeLabel + '（点击切换）';
       }
 
+      function syncParentFont() {
+        try {
+          if (!window.parent || window.parent === window) return;
+          const pDoc = window.parent.document;
+          if (!pDoc) return;
+          for (const el of [pDoc.body, pDoc.documentElement]) {
+            if (!el) continue;
+            const ff = (window.parent.getComputedStyle(el).fontFamily || '').trim();
+            if (ff && !/^serif$/i.test(ff)) {
+              document.documentElement.style.setProperty('--hud-font-sans', ff);
+              return;
+            }
+          }
+        } catch {}
+      }
+
       // 按用户覆盖 > 同源父级真实背景 > 显式属性/colorScheme > 宿主 CSS 变量 > 系统偏好切换面板深浅色令牌
       function syncHudTheme() {
+        syncParentFont();
         try {
           const override = readThemeOverride();
           let dark = null;
@@ -1757,6 +1776,7 @@ const HUD_TEMPLATE_SPINNER_MARKER = 'task-hud-spinner-v3';
 const HUD_TEMPLATE_DONEBAR_MARKER = 'hud-done-chevron';
 const HUD_TEMPLATE_COLLAPSE_MARKER = 'task-hud-collapse-v1';
 const HUD_TEMPLATE_STOP_FOLD_MARKER = 'task-hud-stop-fold-v1';
+const HUD_TEMPLATE_FONT_MARKER = 'task-hud-font-v1';
 
 function serializeJsonForHtmlScript(obj) {
   return JSON.stringify(obj, null, 2)
@@ -1903,7 +1923,8 @@ function upgradeTemplatePreservingData(filePath) {
     origHtml.includes(HUD_TEMPLATE_SPINNER_MARKER) &&
     origHtml.includes(HUD_TEMPLATE_DONEBAR_MARKER) &&
     origHtml.includes(HUD_TEMPLATE_COLLAPSE_MARKER) &&
-    origHtml.includes(HUD_TEMPLATE_STOP_FOLD_MARKER)
+    origHtml.includes(HUD_TEMPLATE_STOP_FOLD_MARKER) &&
+    origHtml.includes(HUD_TEMPLATE_FONT_MARKER)
   ) {
     return;
   }
