@@ -5,7 +5,9 @@ import {
   classifyTool,
   clearAutoSeededHudSlot,
   collapseArtifactHudFile,
+  computeTurnTokensFromTranscript,
   createEmptyStats,
+  createEmptyTokens,
   ensureArtifactHudTemplate,
   finalizeActiveTurn,
   findNextAvailableTurnSlot,
@@ -16,6 +18,7 @@ import {
   loadConversationState,
   loadSettings,
   normalizeAndAdvanceTasks,
+  normalizeEndHudFileName,
   normalizeHudFileName,
   normalizeToolArgs,
   parseArtifactHudHtml,
@@ -28,6 +31,7 @@ import {
   seedDefaultHudTasksIfEmpty,
   summarizeToolStats,
   syncArtifactHudFile,
+  syncEndHudFile,
 } from './state-store.mjs';
 
 const WRITE_TOOLS = new Set(['edit_file', 'write_file', 'replace_file_content']);
@@ -59,10 +63,12 @@ function inspectTranscript(transcriptPath) {
       latestHud: null,
       activeHudFile: '',
       embeddedHudFile: '',
+      embeddedEndHudFile: '',
       usedSlots: [],
       lastPlannerText: '',
       lastToolNames: [],
       hasPlannerAfterLatestUser: false,
+      turnTokens: createEmptyTokens(),
     };
   }
   try {
@@ -72,10 +78,12 @@ function inspectTranscript(transcriptPath) {
     let latestHud = null;
     let activeHudFile = '';
     let embeddedHudFile = '';
+    let embeddedEndHudFile = '';
     let lastPlannerText = '';
     let lastToolNames = [];
     let sawLastPlanner = false;
     const usedSlots = [];
+    const turnTokens = computeTurnTokensFromTranscript(target);
 
     for (let i = lines.length - 1; i >= 0; i--) {
       const line = lines[i].trim();
@@ -99,6 +107,17 @@ function inspectTranscript(transcriptPath) {
               : [];
           }
           if (typeof obj?.content === 'string') {
+            if (!embeddedEndHudFile) {
+              const endRe = /<agent-embed\b[^>]*\bsrc=["'][^"']*?(task-hud-end-t\d+\.html)["'][^>]*>/gi;
+              const endMatches = [...obj.content.matchAll(endRe)];
+              for (let mIdx = endMatches.length - 1; mIdx >= 0; mIdx--) {
+                const endSlot = normalizeEndHudFileName(endMatches[mIdx][1]);
+                if (endSlot) {
+                  embeddedEndHudFile = endSlot;
+                  break;
+                }
+              }
+            }
             const embedRe = /<agent-embed\b[^>]*\bsrc=["'][^"']*?(task-hud(?:-t\d+|-\d+|-end)?\.html)["'][^>]*>/gi;
             const matches = [...obj.content.matchAll(embedRe)];
             for (let mIdx = matches.length - 1; mIdx >= 0; mIdx--) {
@@ -151,10 +170,12 @@ function inspectTranscript(transcriptPath) {
       latestHud,
       activeHudFile,
       embeddedHudFile,
+      embeddedEndHudFile,
       usedSlots,
       lastPlannerText,
       lastToolNames,
       hasPlannerAfterLatestUser: sawLastPlanner,
+      turnTokens,
     };
   } catch {
     return {
@@ -162,10 +183,12 @@ function inspectTranscript(transcriptPath) {
       latestHud: null,
       activeHudFile: '',
       embeddedHudFile: '',
+      embeddedEndHudFile: '',
       usedSlots: [],
       lastPlannerText: '',
       lastToolNames: [],
       hasPlannerAfterLatestUser: false,
+      turnTokens: createEmptyTokens(),
     };
   }
 }
@@ -316,6 +339,7 @@ function rotateToNewTurn(
     startedAt,
     invocationCount: 1,
     stats: createEmptyStats(),
+    tokens: createEmptyTokens(),
     recentTools: [],
     lastAnnouncedToolCount: 0,
   };
@@ -388,6 +412,10 @@ function reconcileTurnWithTranscript(state, tInfo, payload, now = Date.now()) {
     state.activeTurn.autoSeededSlot = '';
   }
 
+  if (state.activeTurn && tInfo.turnTokens && tInfo.turnTokens.total > 0) {
+    state.activeTurn.tokens = { ...tInfo.turnTokens };
+  }
+
   return { isStaleInFlight: false, rotated: false };
 }
 
@@ -407,7 +435,7 @@ function handlePreInvocation(payload, state, settings) {
     state.artifactDirectoryPath = payload.artifactDirectoryPath;
     ensureArtifactHudTemplate(state.artifactDirectoryPath);
   }
-  const { latestUser, latestHud, activeHudFile, embeddedHudFile } = inspectTranscript(state.transcriptPath);
+  const { latestUser, latestHud, activeHudFile, embeddedHudFile, turnTokens } = inspectTranscript(state.transcriptPath);
 
   const userText = cleanUserText(payload.lastUserInput);
   const payloadFingerprint = buildUserInputFingerprint(payload.lastUserInput);
@@ -438,6 +466,7 @@ function handlePreInvocation(payload, state, settings) {
       startedAt: resumed.startedAt || now,
       invocationCount: 2,
       stats: resumed.stats || createEmptyStats(),
+      tokens: resumed.tokens || createEmptyTokens(),
       recentTools: [],
       lastAnnouncedToolCount: resumed.stats?.totalTools || 0,
     };
@@ -516,6 +545,10 @@ function handlePreInvocation(payload, state, settings) {
       now,
       preferredFileName: state.activeTurn.hudFileName,
     });
+  }
+
+  if (state.activeTurn && turnTokens && turnTokens.total > 0) {
+    state.activeTurn.tokens = { ...turnTokens };
   }
 
   // 仅当本轮已明确绑定独立槽位文件名时同步刷新该文件
@@ -769,11 +802,14 @@ function handlePostInvocation(payload, state) {
     return {};
   }
 
-  const { latestHud, activeHudFile, embeddedHudFile, lastToolNames } = tInfo;
+  const { latestHud, activeHudFile, embeddedHudFile, lastToolNames, turnTokens } = tInfo;
   const usableEmbedded = pickUsableHudFile(state.artifactDirectoryPath, embeddedHudFile);
   const usableActive = pickUsableHudFile(state.artifactDirectoryPath, activeHudFile);
 
   if (state.activeTurn) {
+    if (turnTokens && turnTokens.total > 0) {
+      state.activeTurn.tokens = { ...turnTokens };
+    }
     if (usableEmbedded) {
       state.activeTurn.hasUserEmbed = true;
     }
@@ -785,8 +821,7 @@ function handlePostInvocation(payload, state) {
   let targetFileName = state.activeTurn?.hudFileName || usableEmbedded || usableActive || '';
   let injectedOutput = null;
 
-  // 若处于只读 Plan mode（如 Orchestrator）或模型执行工具后尚未主动输出 <agent-embed>，
-  // 由 Hook 分配并初始化槽位，并通过纯文本 systemMessage 提示模型在需要继续调用工具时补嵌（禁止附带 metadata 以防宿主 protobuf reflect panic）
+  // 仅当进入第 2 轮及以上工具调用且尚未嵌入 <agent-embed> 时才触发兜底提醒，避免单步查询产生额外 token 注入
   if (
     state.artifactDirectoryPath &&
     state.activeTurn &&
@@ -794,7 +829,8 @@ function handlePostInvocation(payload, state) {
     !state.activeTurn.hasUserEmbed &&
     !state.activeTurn.autoEmbedInjected &&
     !lastToolNames.includes('exit_plan_mode') &&
-    Number(state.activeTurn.stats?.totalTools || 0) >= 1
+    Number(state.activeTurn.invocationCount || 0) >= 2 &&
+    Number(state.activeTurn.stats?.totalTools || 0) >= 2
   ) {
     const autoSlot = targetFileName || findNextAvailableTurnSlot(state.artifactDirectoryPath, state);
     if (autoSlot) {
@@ -813,7 +849,7 @@ function handlePostInvocation(payload, state) {
         injectSteps: [
           {
             systemMessage: {
-              systemMessage: `任务进度面板槽位 ${autoSlot} 已就绪，但当前对话界面尚未嵌入该面板。若后续仍需继续调用工具，请在下一轮回复中直接输出唯一一次 <agent-embed src="${fileUri}"></agent-embed>（标签外不要写过程文字）并同时发起下一步工具调用；若处于只读 Plan mode 无需调用 edit_file，Hook 会自动实时同步该面板的进度与计时；若已准备直接给出最终回答，则无需再嵌入。`,
+              systemMessage: `HUD ${autoSlot} 就绪：若还需调工具，下步仅输出 <agent-embed src="${fileUri}"></agent-embed> 并同时调工具；直接作答则忽略。`,
             },
           },
         ],
@@ -842,7 +878,7 @@ function handleStop(payload, state) {
   if (payload.transcriptPath) state.transcriptPath = payload.transcriptPath;
   if (payload.artifactDirectoryPath) state.artifactDirectoryPath = payload.artifactDirectoryPath;
 
-  const { latestUser, latestHud, activeHudFile, embeddedHudFile, lastPlannerText, lastToolNames } = inspectTranscript(state.transcriptPath);
+  const { latestUser, latestHud, activeHudFile, embeddedHudFile, embeddedEndHudFile, lastPlannerText, lastToolNames, turnTokens } = inspectTranscript(state.transcriptPath);
   const termReason = payload.terminationReason || 'NO_TOOL_CALL';
   const isPlanHandover =
     lastToolNames.includes('exit_plan_mode') &&
@@ -883,6 +919,9 @@ function handleStop(payload, state) {
   const usableActive = pickUsableHudFile(state.artifactDirectoryPath, activeHudFile);
 
   if (state.activeTurn) {
+    if (turnTokens && turnTokens.total > 0) {
+      state.activeTurn.tokens = { ...turnTokens };
+    }
     if (usableEmbedded) {
       state.activeTurn.hasUserEmbed = true;
     }
@@ -928,7 +967,7 @@ function handleStop(payload, state) {
       });
       return {
         decision: 'continue',
-        reason: `你刚才仅输出了 <agent-embed> 而未同时调用业务工具，导致执行循环误判为结束。请立即调用工具继续执行 ${preStopFile} 中未完成的任务，待全部完成后再输出最终总结。`,
+        reason: `仅输出了 <agent-embed> 未调工具，请继续执行 ${preStopFile} 未完成任务后再总结。`,
       };
     }
   }
@@ -1015,6 +1054,17 @@ function handleStop(payload, state) {
         targetFileName,
       });
     }
+  }
+  const endTargetFile =
+    normalizeEndHudFileName(embeddedEndHudFile) ||
+    normalizeEndHudFileName(state.activeTurn?.endHudFileName) ||
+    normalizeEndHudFileName(completed?.endHudFileName);
+  if (endTargetFile && state.artifactDirectoryPath) {
+    syncEndHudFile(state.artifactDirectoryPath, state, {
+      turnFinished: true,
+      now,
+      targetFileName: endTargetFile,
+    });
   }
   return {};
 }

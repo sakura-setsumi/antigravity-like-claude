@@ -1,15 +1,29 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 export const PLUGIN_NAME = 'task-hud';
 export const SAFE_ID_RE = /^[a-zA-Z0-9_-]{8,128}$/;
 export const TURN_HUD_FILE_RE = /^task-hud(?:-t(\d+))?\.html$/i;
+export const END_HUD_FILE_RE = /^task-hud-end-t(\d+)\.html$/i;
 
 export function normalizeHudFileName(fileOrPath) {
   if (!fileOrPath) return '';
   const base = basename(String(fileOrPath).trim()).toLowerCase();
   return TURN_HUD_FILE_RE.test(base) ? base : '';
+}
+
+export function normalizeEndHudFileName(fileOrPath) {
+  if (!fileOrPath) return '';
+  const base = basename(String(fileOrPath).trim()).toLowerCase();
+  return END_HUD_FILE_RE.test(base) ? base : '';
+}
+
+export function deriveEndHudFileName(hudFileName, fallbackIndex = 1) {
+  const m = String(hudFileName || '').match(/^task-hud-t(\d+)\.html$/i);
+  const idx = m ? Number(m[1]) : Math.max(1, Number(fallbackIndex) || 1);
+  return `task-hud-end-t${idx}.html`;
 }
 
 export function listTurnSlotNames(maxCount = 24) {
@@ -143,6 +157,196 @@ export function createEmptyStats() {
   };
 }
 
+export function createEmptyTokens() {
+  return {
+    input: 0,
+    cacheRead: 0,
+    output: 0,
+    total: 0,
+    plugin: 0,
+    main: 0,
+  };
+}
+
+export function formatTokenCompact(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v) || v <= 0) return '0';
+  if (v >= 1e6) return `${(v / 1e6).toFixed(1).replace(/\.0$/, '')}M`;
+  if (v >= 1e3) return `${(v / 1e3).toFixed(1).replace(/\.0$/, '')}K`;
+  return String(Math.round(v));
+}
+
+export function formatTokenText(tokens) {
+  const total = Number(tokens?.total || 0);
+  if (!Number.isFinite(total) || total <= 0) return '';
+  const plugin = Math.max(0, Math.min(total, Number(tokens?.plugin || 0)));
+  const main = Math.max(0, total - plugin);
+  if (plugin > 0) {
+    return `${formatTokenCompact(total)} tok（${formatTokenCompact(main)} / ${formatTokenCompact(plugin)}）`;
+  }
+  return `${formatTokenCompact(total)} tok`;
+}
+
+export function formatTokenDetail(tokens) {
+  if (!tokens || Number(tokens.total || 0) <= 0) return '';
+  const total = Number(tokens.total || 0);
+  const plugin = Math.max(0, Math.min(total, Number(tokens.plugin || 0)));
+  const main = Math.max(0, total - plugin);
+  const splitPart = plugin > 0 ? `本体 ${formatTokenCompact(main)} · 插件 ${formatTokenCompact(plugin)}` : '';
+  const parts = [];
+  if (tokens.input > 0) parts.push(`输入 ${formatTokenCompact(tokens.input)}`);
+  if (tokens.cacheRead > 0) parts.push(`缓存 ${formatTokenCompact(tokens.cacheRead)}`);
+  if (tokens.output > 0) parts.push(`输出 ${formatTokenCompact(tokens.output)}`);
+  const usagePart = parts.join(' · ');
+  return splitPart && usagePart ? `${splitPart} | ${usagePart}` : splitPart || usagePart;
+}
+
+let cachedPluginRulesTokens = null;
+function getPluginRulesTokens() {
+  if (cachedPluginRulesTokens !== null) return cachedPluginRulesTokens;
+  try {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const agentsPath = join(here, '..', 'rules', 'AGENTS.md');
+    const txt = existsSync(agentsPath) ? readFileSync(agentsPath, 'utf-8') : '';
+    // 规则正文 + 懒加载工具名声明（约 15 tok）
+    cachedPluginRulesTokens = estimateTextTokens(txt) + 15;
+  } catch {
+    cachedPluginRulesTokens = 0;
+  }
+  return cachedPluginRulesTokens;
+}
+
+export function estimateTextTokens(text) {
+  const s = String(text || '');
+  if (!s) return 0;
+  const cjk = (s.match(/[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]/g) || []).length;
+  const ascii = s.length - cjk;
+  return Math.max(1, Math.round(cjk * 1.1 + ascii / 3.8));
+}
+
+export function computeTurnTokensFromTranscript(transcriptPath, userStepIndex = null) {
+  const out = createEmptyTokens();
+  if (!transcriptPath || !existsSync(transcriptPath)) return out;
+  try {
+    const raw = readFileSync(transcriptPath, 'utf-8');
+    const lines = raw.trim().split('\n');
+    let startIdx = -1;
+    let endIdx = lines.length;
+
+    if (userStepIndex !== null && userStepIndex !== undefined && Number.isFinite(Number(userStepIndex))) {
+      const targetStep = Number(userStepIndex);
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i].trim();
+        if (!line) continue;
+        try {
+          const obj = JSON.parse(line);
+          if (obj?.type === 'USER_INPUT') {
+            if (Number(obj.step_index) === targetStep) {
+              startIdx = i;
+              break;
+            }
+            endIdx = i;
+          }
+        } catch {
+          continue;
+        }
+      }
+    } else {
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i].trim();
+        if (!line) continue;
+        try {
+          const obj = JSON.parse(line);
+          if (obj?.type === 'USER_INPUT') {
+            startIdx = i;
+            break;
+          }
+        } catch {
+          continue;
+        }
+      }
+    }
+
+    if (startIdx === -1) return out;
+
+    const turnObjs = [];
+    for (let i = startIdx + 1; i < endIdx; i++) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      try {
+        turnObjs.push(JSON.parse(line));
+      } catch {
+        continue;
+      }
+    }
+
+    const totalPlanners = turnObjs.filter((o) => o?.type === 'PLANNER_RESPONSE').length;
+    let seenPlanners = 0;
+    let pendingHudToolReturns = 0;
+    let pluginEst = totalPlanners * getPluginRulesTokens();
+
+    for (const obj of turnObjs) {
+      if (obj?.type === 'PLANNER_RESPONSE') {
+        seenPlanners++;
+        const remainingPlanners = Math.max(0, totalPlanners - seenPlanners);
+        const inTok = Number(obj.input_tokens);
+        const cacheTok = Number(obj.cache_read_tokens);
+        const outTok = Number(obj.output_tokens);
+        if (Number.isFinite(inTok) && inTok > 0) out.input += inTok;
+        if (Number.isFinite(cacheTok) && cacheTok > 0) out.cacheRead += cacheTok;
+        if (Number.isFinite(outTok) && outTok > 0) out.output += outTok;
+
+        // 估算本步产出的 <agent-embed ...task-hud...> 标签 token（产出 1 次 + 后续每轮上下文复用）
+        if (typeof obj.content === 'string') {
+          const embeds = obj.content.match(/<agent-embed\b[^>]*task-hud[^>]*><\/agent-embed>/gi);
+          if (embeds) {
+            for (const tag of embeds) {
+              pluginEst += estimateTextTokens(tag) * (1 + remainingPlanners);
+            }
+          }
+        }
+
+        // 估算本步调用 task-hud 内部工具的参数 token（产出 1 次 + 后续每轮上下文复用）
+        pendingHudToolReturns = 0;
+        if (Array.isArray(obj.tool_calls)) {
+          for (const tc of obj.tool_calls) {
+            const normArgs = normalizeToolArgs(tc?.args);
+            if (isHudInternalTool(tc?.name, normArgs)) {
+              const callText = `${tc?.name || ''}${JSON.stringify(tc?.args || {})}`;
+              pluginEst += estimateTextTokens(callText) * (1 + remainingPlanners);
+              pendingHudToolReturns++;
+            }
+          }
+        }
+      } else if (obj?.type === 'SYSTEM_MESSAGE') {
+        const content = String(obj.content || '');
+        if (/task-hud/i.test(content)) {
+          const remainingPlanners = Math.max(0, totalPlanners - seenPlanners);
+          if (remainingPlanners > 0) {
+            pluginEst += estimateTextTokens(content) * remainingPlanners;
+          }
+        }
+      } else if (obj?.type === 'GENERIC' && pendingHudToolReturns > 0) {
+        const content = String(obj.content || '');
+        if (/task-hud|任务组件已就绪|已更新\s*\d+\s*项任务|任务清单已同步|^OK\s+\d+\/\d+/i.test(content)) {
+          const remainingPlanners = Math.max(0, totalPlanners - seenPlanners);
+          if (remainingPlanners > 0) {
+            pluginEst += estimateTextTokens(content) * remainingPlanners;
+          }
+          pendingHudToolReturns--;
+        }
+      }
+    }
+
+    out.total = out.input + out.cacheRead + out.output;
+    out.plugin = out.total > 0 ? Math.min(out.total, Math.round(pluginEst)) : 0;
+    out.main = Math.max(0, out.total - out.plugin);
+    return out;
+  } catch {
+    return out;
+  }
+}
+
 export function createEmptyConversationState(conversationId) {
   return {
     version: 1,
@@ -176,6 +380,7 @@ export function finalizeActiveTurn(state, { terminationReason = 'NO_TOOL_CALL', 
     userFingerprint: t.userFingerprint || '',
     payloadFingerprint: t.payloadFingerprint || '',
     hudFileName: t.hudFileName || '',
+    endHudFileName: t.endHudFileName || '',
     hasUserEmbed: Boolean(t.hasUserEmbed),
     autoEmbedInjected: Boolean(t.autoEmbedInjected),
     autoSeededSlot: t.autoSeededSlot || '',
@@ -186,6 +391,7 @@ export function finalizeActiveTurn(state, { terminationReason = 'NO_TOOL_CALL', 
     elapsedMs: Math.max(0, endedAt - startedAtNum),
     terminationReason,
     stats: t.stats || createEmptyStats(),
+    tokens: t.tokens || createEmptyTokens(),
     announcedInChat: false,
   };
 
@@ -199,10 +405,14 @@ export function finalizeActiveTurn(state, { terminationReason = 'NO_TOOL_CALL', 
     const startedAt = Math.min(prev.startedAt || completed.startedAt, completed.startedAt);
     completed.turnIndex = prev.turnIndex;
     completed.hudFileName = completed.hudFileName || prev.hudFileName || '';
+    completed.endHudFileName = completed.endHudFileName || prev.endHudFileName || '';
     completed.hudCollapsed = Boolean(completed.hudCollapsed || prev.hudCollapsed);
     completed.interrupted = Boolean(completed.interrupted);
     completed.userFingerprint = completed.userFingerprint || prev.userFingerprint || '';
     completed.payloadFingerprint = completed.payloadFingerprint || prev.payloadFingerprint || '';
+    if ((prev.tokens?.total || 0) > (completed.tokens?.total || 0)) {
+      completed.tokens = prev.tokens;
+    }
     completed.startedAt = startedAt;
     completed.elapsedMs = Math.max(0, endedAt - startedAt);
     state.turns[lastIdx] = completed;
@@ -963,6 +1173,8 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
   "turnIndex": 1,
   "startedAt": 0,
   "elapsedMs": 0,
+  "tokenText": "",
+  "tokenDetail": "",
   "statsText": "",
   "steps": []
 }
@@ -988,6 +1200,8 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
             <span id="hud-dot" class="hud-dot dot-running"></span>
             <span id="hud-timer-label" class="hud-muted">本轮对话已用时</span>
             <span id="hud-timer-val" class="hud-timer-val">0s</span>
+            <span id="hud-token-sep" class="hud-muted hidden">·</span>
+            <span id="hud-token-val" class="hud-timer-val hidden"></span>
           </div>
           <div class="hud-top-right">
             <div id="hud-stats" class="hud-stats"></div>
@@ -1007,6 +1221,7 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
   <script>
     (() => {
       /* task-hud-stop-fold-v1 */
+      /* task-hud-token-v1 */
       const $ = (id) => document.getElementById(id);
       let currentData = null;
 
@@ -1300,6 +1515,15 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
             : currentData.elapsedMs || (currentData.startedAt ? Date.now() - currentData.startedAt : 0);
           $('hud-timer-val').textContent = formatDuration(ms);
         }
+        const tokSep = $('hud-token-sep');
+        const tokVal = $('hud-token-val');
+        if (tokSep && tokVal) {
+          const tokText = String(currentData.tokenText || '').trim();
+          tokSep.classList.toggle('hidden', !tokText);
+          tokVal.classList.toggle('hidden', !tokText);
+          tokVal.textContent = tokText;
+          tokVal.title = String(currentData.tokenDetail || '');
+        }
       }
 
       function summarizeToolGroup(tools, thoughtSec) {
@@ -1493,7 +1717,9 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
         const taskPart = tasks.length > 0 ? \`已转入后续追问 · 已完成 \${doneCount}/\${tasks.length} 项\` : '已转入后续追问';
 
         if (dotEl) { dotEl.className = 'hud-done-icon is-superseded'; dotEl.innerHTML = HUD_ICON_PAUSED; }
-        $('hud-done-text').textContent = ms > 0 ? \`中断前用时 \${durationStr} · \${taskPart}\` : taskPart;
+        const tokPart = currentData?.tokenText ? \` · \${currentData.tokenText}\` : '';
+        $('hud-done-text').textContent = ms > 0 ? \`中断前用时 \${durationStr}\${tokPart} · \${taskPart}\` : \`\${taskPart}\${tokPart}\`;
+        $('hud-done-text').title = String(currentData?.tokenDetail || '');
         $('hud-done-stats').textContent = currentData?.statsText || '';
         doneBodyEl.appendChild(liveBodyEl);
         rootEl.classList.remove('hidden');
@@ -1516,6 +1742,7 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
           logs: data.logs,
           steps: data.steps,
           statsText: data.statsText,
+          tokenText: data.tokenText || '',
           elapsedMs: data.elapsedMs,
         });
         if (sig === lastSig) return;
@@ -1597,8 +1824,10 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
             ms = Math.max(0, Date.now() - data.startedAt);
           }
           const durationStr = formatDuration(ms);
+          const tokPart = data.tokenText ? \` · \${data.tokenText}\` : '';
           const taskPart = tasks.length > 0 ? \`已完成 \${doneCount}/\${tasks.length} 项任务\` : '已完成';
-          $('hud-done-text').textContent = \`本轮用时 \${durationStr} · \${taskPart}\`;
+          $('hud-done-text').textContent = \`本轮用时 \${durationStr}\${tokPart} · \${taskPart}\`;
+          $('hud-done-text').title = String(data.tokenDetail || '');
           $('hud-done-stats').textContent = data.statsText || '';
           doneBodyEl.appendChild(liveBodyEl);
           doneFoldEl.classList.remove('hidden');
@@ -1623,14 +1852,16 @@ const HUD_HTML_TEMPLATE = `<!DOCTYPE html>
             ms = Math.max(0, Date.now() - data.startedAt);
           }
           const durationStr = formatDuration(ms);
+          const tokPart = data.tokenText ? \` · \${data.tokenText}\` : '';
           const isUserCanceled = data.terminationReason === 'USER_CANCELED';
           if (isUserCanceled) {
-            const taskPart = tasks.length > 0 ? \`已停止 · 用时 \${durationStr} · 已完成 \${doneCount}/\${tasks.length} 项\` : \`已停止 · 用时 \${durationStr}\`;
+            const taskPart = tasks.length > 0 ? \`已停止 · 用时 \${durationStr}\${tokPart} · 已完成 \${doneCount}/\${tasks.length} 项\` : \`已停止 · 用时 \${durationStr}\${tokPart}\`;
             $('hud-done-text').textContent = taskPart;
           } else {
             const taskPart = tasks.length > 0 ? \`已完成 \${doneCount}/\${tasks.length} 项\` : '已中断';
-            $('hud-done-text').textContent = ms > 0 ? \`中断前用时 \${durationStr} · \${taskPart}\` : taskPart;
+            $('hud-done-text').textContent = ms > 0 ? \`中断前用时 \${durationStr}\${tokPart} · \${taskPart}\` : \`\${taskPart}\${tokPart}\`;
           }
+          $('hud-done-text').title = String(data.tokenDetail || '');
           $('hud-done-stats').textContent = data.statsText || '';
           doneBodyEl.appendChild(liveBodyEl);
           doneFoldEl.classList.remove('hidden');
@@ -1777,6 +2008,7 @@ const HUD_TEMPLATE_DONEBAR_MARKER = 'hud-done-chevron';
 const HUD_TEMPLATE_COLLAPSE_MARKER = 'task-hud-collapse-v1';
 const HUD_TEMPLATE_STOP_FOLD_MARKER = 'task-hud-stop-fold-v1';
 const HUD_TEMPLATE_FONT_MARKER = 'task-hud-font-v1';
+const HUD_TEMPLATE_TOKEN_MARKER = 'task-hud-token-v1';
 
 function serializeJsonForHtmlScript(obj) {
   return JSON.stringify(obj, null, 2)
@@ -1924,7 +2156,8 @@ function upgradeTemplatePreservingData(filePath) {
     origHtml.includes(HUD_TEMPLATE_DONEBAR_MARKER) &&
     origHtml.includes(HUD_TEMPLATE_COLLAPSE_MARKER) &&
     origHtml.includes(HUD_TEMPLATE_STOP_FOLD_MARKER) &&
-    origHtml.includes(HUD_TEMPLATE_FONT_MARKER)
+    origHtml.includes(HUD_TEMPLATE_FONT_MARKER) &&
+    origHtml.includes(HUD_TEMPLATE_TOKEN_MARKER)
   ) {
     return;
   }
@@ -2384,6 +2617,12 @@ export function syncArtifactHudFile(
       : 0;
     const statsText = summarizeToolStats(activeTurn?.stats || lastTurn?.stats) || '';
     const resolvedReason = isInterrupted ? String(terminationReason || lastTurn?.terminationReason || '') : '';
+    const targetUserStep = activeTurn?.userStepIndex ?? lastTurn?.userStepIndex ?? null;
+    const txTokens = computeTurnTokensFromTranscript(compactTranscript, targetUserStep);
+    const savedTokens = activeTurn?.tokens || lastTurn?.tokens || createEmptyTokens();
+    const resolvedTokens = (txTokens.total || 0) >= (savedTokens.total || 0) ? txTokens : savedTokens;
+    const tokenText = formatTokenText(resolvedTokens);
+    const tokenDetail = formatTokenDetail(resolvedTokens);
 
     const runtimeObj = {
       status,
@@ -2391,6 +2630,8 @@ export function syncArtifactHudFile(
       turnIndex,
       startedAt,
       elapsedMs,
+      tokenText,
+      tokenDetail,
       statsText,
       steps,
     };
@@ -2405,6 +2646,263 @@ export function syncArtifactHudFile(
     return true;
   } catch {
     return false;
+  }
+}
+
+const HUD_END_DATA_SCRIPT_RE = /(<script[^>]*id=["']task-hud-end-data["'][^>]*>)([\s\S]*?)(<\/script>)/i;
+
+const HUD_END_HTML_TEMPLATE = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    :root {
+      --hud-font-sans: var(--font-sans, var(--vscode-font-family, "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", -apple-system, BlinkMacSystemFont, Roboto, "PingFang SC", sans-serif));
+      --pill-bg: rgba(15, 23, 42, 0.045);
+      --pill-border: rgba(15, 23, 42, 0.11);
+      --pill-text: #475569;
+      --pill-text-strong: #1e293b;
+      --pill-icon: #64748b;
+    }
+    :root[data-hud-theme="dark"] {
+      --pill-bg: rgba(255, 255, 255, 0.055);
+      --pill-border: rgba(255, 255, 255, 0.11);
+      --pill-text: #a1a1aa;
+      --pill-text-strong: #e4e4e7;
+      --pill-icon: #94a3b8;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root:not([data-hud-theme]) {
+        --pill-bg: rgba(255, 255, 255, 0.055);
+        --pill-border: rgba(255, 255, 255, 0.11);
+        --pill-text: #a1a1aa;
+        --pill-text-strong: #e4e4e7;
+        --pill-icon: #94a3b8;
+      }
+    }
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: transparent;
+      font-family: var(--hud-font-sans);
+      font-size: 12px;
+      line-height: 1;
+      -webkit-font-smoothing: antialiased;
+      overflow: hidden;
+      scrollbar-width: none !important;
+    }
+    html::-webkit-scrollbar, body::-webkit-scrollbar { display: none !important; width: 0 !important; height: 0 !important; }
+    .end-bar {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
+      padding: 2px 0;
+    }
+    .end-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      height: 24px;
+      padding: 0 9px;
+      border-radius: 6px;
+      background: var(--pill-bg);
+      border: 1px solid var(--pill-border);
+      color: var(--pill-text);
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+      user-select: none;
+    }
+    .end-pill svg {
+      width: 13px;
+      height: 13px;
+      color: var(--pill-icon);
+      flex-shrink: 0;
+    }
+    .end-pill strong {
+      font-weight: 500;
+      color: var(--pill-text-strong);
+    }
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+  <script id="task-hud-end-data" type="application/json">
+{
+  "status": "finalizing",
+  "durationText": "",
+  "tokenText": "",
+  "tokenDetail": ""
+}
+  </script>
+  <div id="end-bar" class="end-bar hidden">
+    <span id="pill-time" class="end-pill hidden">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="8.5" r="5.5"/><path d="M8 5.5v3l2 1.2M6.2 1.8h3.6"/></svg>
+      <span>用时</span><strong id="val-time"></strong>
+    </span>
+    <span id="pill-tok" class="end-pill hidden">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="8" cy="4" rx="4.8" ry="1.8"/><path d="M3.2 4v8c0 1 2.15 1.8 4.8 1.8s4.8-.8 4.8-1.8V4M3.2 8c0 1 2.15 1.8 4.8 1.8s4.8-.8 4.8-1.8"/></svg>
+      <span>用量</span><strong id="val-tok"></strong>
+    </span>
+  </div>
+  <script>
+    (() => {
+      const $ = (id) => document.getElementById(id);
+      const THEME_STORAGE_KEY = 'task-hud-theme-override';
+      function lumOf(c) {
+        if (!c) return null;
+        const body = c.slice(c.indexOf('(') + 1).replace(/^\\s*[a-z][\\w-]*\\s+/i, '');
+        const nums = (body.match(/[\\d.]+/g) || []).map(Number);
+        if (nums.length < 3 || (nums.length >= 4 && nums[3] === 0)) return null;
+        const scale = c.startsWith('color(') ? 1 : 255;
+        const [r, g, b] = nums.slice(0, 3).map((v) => v / scale);
+        return 0.2126 * r + 0.7152 * g + 0.722 * 0 + 0.0722 * b;
+      }
+      function syncTheme() {
+        try {
+          const ov = localStorage.getItem(THEME_STORAGE_KEY);
+          if (ov === 'light' || ov === 'dark') {
+            document.documentElement.dataset.hudTheme = ov;
+            return;
+          }
+        } catch {}
+        try {
+          if (window.parent && window.parent !== window) {
+            const pDoc = window.parent.document;
+            if (pDoc) {
+              for (const el of [pDoc.body, pDoc.documentElement]) {
+                if (!el) continue;
+                const ff = (window.parent.getComputedStyle(el).fontFamily || '').trim();
+                if (ff && !/^serif$/i.test(ff)) {
+                  document.documentElement.style.setProperty('--hud-font-sans', ff);
+                  break;
+                }
+              }
+              for (const el of [pDoc.body, pDoc.documentElement]) {
+                if (!el) continue;
+                const bg = window.parent.getComputedStyle(el).backgroundColor || '';
+                const nums = (bg.match(/[\\d.]+/g) || []).map(Number);
+                if (nums.length >= 3 && !(nums.length >= 4 && nums[3] === 0)) {
+                  const scale = bg.startsWith('color(') ? 1 : 255;
+                  const lum = (0.2126 * nums[0] + 0.7152 * nums[1] + 0.0722 * nums[2]) / scale;
+                  document.documentElement.dataset.hudTheme = lum < 0.5 ? 'dark' : 'light';
+                  return;
+                }
+              }
+            }
+          }
+        } catch {}
+        const dark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+        document.documentElement.dataset.hudTheme = dark ? 'dark' : 'light';
+      }
+      syncTheme();
+
+      let lastSig = '';
+      let timer = null;
+      let pollCount = 0;
+
+      function parseData(docText) {
+        let raw = '';
+        if (docText) {
+          const m = docText.match(/<script[^>]*id=["']task-hud-end-data["'][^>]*>([\\s\\S]*?)<\\/script>/i);
+          raw = m && m[1] ? m[1] : '{}';
+        } else {
+          raw = $('task-hud-end-data')?.textContent || '{}';
+        }
+        try { return JSON.parse(raw.trim()); } catch { return {}; }
+      }
+
+      function render(d) {
+        if (!d || typeof d !== 'object') return;
+        const sig = JSON.stringify(d);
+        if (sig === lastSig) return;
+        lastSig = sig;
+        const dur = String(d.durationText || '').trim();
+        const tok = String(d.tokenText || '').trim();
+        const det = String(d.tokenDetail || '').trim();
+        $('val-time').textContent = dur;
+        $('pill-time').classList.toggle('hidden', !dur);
+        $('val-tok').textContent = tok;
+        $('pill-tok').title = det;
+        $('pill-tok').classList.toggle('hidden', !tok);
+        $('end-bar').classList.toggle('hidden', !dur && !tok);
+        if (d.status === 'done' && timer) {
+          clearInterval(timer);
+          timer = null;
+        }
+      }
+
+      render(parseData());
+      const init = parseData();
+      if (init.status !== 'done') {
+        timer = setInterval(async () => {
+          pollCount++;
+          if (pollCount > 40) { clearInterval(timer); timer = null; return; }
+          try {
+            if (!location.href || location.href.startsWith('about:') || location.href.startsWith('data:')) return;
+            const res = await fetch(location.href, { cache: 'no-store' });
+            if (!res.ok) return;
+            render(parseData(await res.text()));
+          } catch {}
+        }, 450);
+      }
+    })();
+  </script>
+</body>
+</html>
+`;
+
+export function syncEndHudFile(
+  artifactDir,
+  state,
+  { turnFinished = false, now = Date.now(), targetFileName = '' } = {}
+) {
+  if (!artifactDir) return '';
+  const activeTurn = state.activeTurn;
+  const lastTurn = state.lastCompletedTurn;
+  const fallbackIdx = activeTurn?.turnIndex || lastTurn?.turnIndex || 1;
+  const fileName =
+    normalizeEndHudFileName(targetFileName) ||
+    normalizeEndHudFileName(activeTurn?.endHudFileName) ||
+    normalizeEndHudFileName(turnFinished ? lastTurn?.endHudFileName : '') ||
+    deriveEndHudFileName(activeTurn?.hudFileName || lastTurn?.hudFileName || '', fallbackIdx);
+  if (!fileName) return '';
+
+  try {
+    ensureDir(artifactDir);
+    const htmlPath = join(artifactDir, fileName);
+    const startedAt = activeTurn?.startedAt || lastTurn?.startedAt || now;
+    const elapsedMs = turnFinished
+      ? (typeof lastTurn?.elapsedMs === 'number' && Number.isFinite(lastTurn.elapsedMs)
+          ? Math.max(0, lastTurn.elapsedMs)
+          : Math.max(0, now - startedAt))
+      : Math.max(0, now - startedAt);
+    const compactTranscript = resolveCompactPath(state.transcriptPath);
+    const targetUserStep = activeTurn?.userStepIndex ?? lastTurn?.userStepIndex ?? null;
+    const txTokens = computeTurnTokensFromTranscript(compactTranscript, targetUserStep);
+    const savedTokens = activeTurn?.tokens || lastTurn?.tokens || createEmptyTokens();
+    const resolvedTokens = (txTokens.total || 0) >= (savedTokens.total || 0) ? txTokens : savedTokens;
+
+    const payload = {
+      status: turnFinished ? 'done' : 'finalizing',
+      durationText: formatDuration(elapsedMs),
+      tokenText: formatTokenText(resolvedTokens),
+      tokenDetail: formatTokenDetail(resolvedTokens),
+    };
+    const json = serializeJsonForHtmlScript(payload);
+    const nextHtml = HUD_END_HTML_TEMPLATE.replace(
+      HUD_END_DATA_SCRIPT_RE,
+      (_, open, _body, close) => `${open}\n${json}\n  ${close}`
+    );
+    const prevHtml = existsSync(htmlPath) ? readFileSync(htmlPath, 'utf-8') : '';
+    if (nextHtml !== prevHtml) {
+      writeTextAtomic(htmlPath, nextHtml);
+    }
+    return fileName;
+  } catch {
+    return '';
   }
 }
 

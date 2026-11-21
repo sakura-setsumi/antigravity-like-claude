@@ -38,6 +38,39 @@
     return `${mins}m ${secs}s`;
   }
 
+  function formatTokenNum(n) {
+    const v = Number(n);
+    if (!Number.isFinite(v) || v <= 0) return '0';
+    if (v >= 1e6) return `${(v / 1e6).toFixed(1).replace(/\.0$/, '')}M`;
+    if (v >= 1e3) return `${(v / 1e3).toFixed(1).replace(/\.0$/, '')}K`;
+    return String(Math.round(v));
+  }
+
+  function formatTokenCompact(tokens) {
+    const total = typeof tokens === 'object' ? Number(tokens?.total || 0) : Number(tokens || 0);
+    if (!Number.isFinite(total) || total <= 0) return '';
+    const plugin = typeof tokens === 'object' ? Math.max(0, Math.min(total, Number(tokens?.plugin || 0))) : 0;
+    const main = Math.max(0, total - plugin);
+    if (plugin > 0) {
+      return `${formatTokenNum(total)} tok（${formatTokenNum(main)} / ${formatTokenNum(plugin)}）`;
+    }
+    return `${formatTokenNum(total)} tok`;
+  }
+
+  function formatTokenDetail(tokens) {
+    if (!tokens || Number(tokens.total || 0) <= 0) return '';
+    const total = Number(tokens.total || 0);
+    const plugin = Math.max(0, Math.min(total, Number(tokens.plugin || 0)));
+    const main = Math.max(0, total - plugin);
+    const splitPart = plugin > 0 ? `本体 ${formatTokenNum(main)} · 插件 ${formatTokenNum(plugin)}` : '';
+    const parts = [];
+    if (tokens.input > 0) parts.push(`输入 ${formatTokenNum(tokens.input)}`);
+    if (tokens.cacheRead > 0) parts.push(`缓存 ${formatTokenNum(tokens.cacheRead)}`);
+    if (tokens.output > 0) parts.push(`输出 ${formatTokenNum(tokens.output)}`);
+    const usagePart = parts.join(' · ');
+    return splitPart && usagePart ? `${splitPart} | ${usagePart}` : splitPart || usagePart;
+  }
+
   function formatClock(ms) {
     if (!ms) return '—';
     const d = new Date(ms);
@@ -98,7 +131,9 @@
     if (snap.status === 'running' && snap.activeTurn) {
       const elapsed = Math.max(0, now - (snap.activeTurn.startedAt || now));
       prefix.textContent = `第 ${snap.activeTurn.turnIndex || 1} 轮进行中 · 已用时`;
-      value.textContent = formatDuration(elapsed);
+      const tokText = formatTokenCompact(snap.activeTurn.tokens);
+      value.textContent = tokText ? `${formatDuration(elapsed)} · ${tokText}` : formatDuration(elapsed);
+      value.title = formatTokenDetail(snap.activeTurn.tokens);
       const s = summarizeStats(snap.activeTurn.stats);
       statsLine.textContent = s || '正在分析并准备执行步骤…';
     } else if (snap.lastCompletedTurn) {
@@ -109,12 +144,17 @@
       } else {
         prefix.textContent = `第 ${turnNo} 轮 · 用时`;
       }
-      value.textContent = formatDuration(snap.lastCompletedTurn.elapsedMs);
+      const tokText = formatTokenCompact(snap.lastCompletedTurn.tokens);
+      value.textContent = tokText
+        ? `${formatDuration(snap.lastCompletedTurn.elapsedMs)} · ${tokText}`
+        : formatDuration(snap.lastCompletedTurn.elapsedMs);
+      value.title = formatTokenDetail(snap.lastCompletedTurn.tokens);
       const s = summarizeStats(snap.lastCompletedTurn.stats);
       statsLine.textContent = s || (snap.status === 'interrupted' ? '本轮已中止' : '本轮直接回答，未调用外部工具');
     } else {
       prefix.textContent = '等待对话';
       value.textContent = '—';
+      value.title = '';
       statsLine.textContent = '暂无工具执行记录';
     }
 
@@ -191,17 +231,23 @@
           const expanded = state.expandedTurns.has(id);
           const promptText = turn.userInput || '（无文本输入）';
           const statSummary = summarizeStats(turn.stats) || '纯文本回复';
+          const tokText = formatTokenCompact(turn.tokens);
+          const tokDetail = formatTokenDetail(turn.tokens);
+          const durationLabel = tokText
+            ? `用时 ${formatDuration(turn.elapsedMs)} · ${tokText}`
+            : `用时 ${formatDuration(turn.elapsedMs)}`;
           return `
             <div class="turn-card ${expanded ? 'expanded' : ''}" data-turn="${esc(id)}">
               <button class="turn-row" type="button">
                 <span class="turn-index">#${esc(id)}</span>
-                <span class="turn-duration">用时 ${esc(formatDuration(turn.elapsedMs))}</span>
+                <span class="turn-duration" title="${esc(tokDetail)}">${esc(durationLabel)}</span>
                 <span class="turn-prompt">${esc(promptText)}</span>
                 <span class="turn-chevron">›</span>
               </button>
               <div class="turn-detail">
                 <div class="turn-detail-prompt">${esc(promptText)}</div>
                 <div>时间：${esc(formatClock(turn.startedAt))} → ${esc(formatClock(turn.endedAt))}</div>
+                ${tokDetail ? `<div>Token：${esc(tokText)}（${esc(tokDetail)}）</div>` : ''}
                 <div>统计：${esc(statSummary)}</div>
               </div>
             </div>`;

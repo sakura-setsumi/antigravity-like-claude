@@ -1,6 +1,7 @@
 import { join } from 'node:path';
 import {
   createEmptyStats,
+  deriveEndHudFileName,
   findNextAvailableTurnSlot,
   isHudSlotCollapsedFile,
   loadConversationState,
@@ -9,6 +10,7 @@ import {
   resolveDataDir,
   saveConversationState,
   syncArtifactHudFile,
+  syncEndHudFile,
   writeArtifactHudTasks,
 } from './state-store.mjs';
 
@@ -18,18 +20,14 @@ const SUPPORTED_VERSIONS = ['2025-03-26', '2024-11-05'];
 const TOOLS = [
   {
     name: 'task_hud_init',
-    description:
-      '初始化本轮任务进度组件：传入简洁 JSON 任务列表（支持字符串数组或 {id,title} 数组）与可选首步进展说明，后端自动分配本轮槽位并原子写入组件数据，返回可直接输出的 <agent-embed> 标签。',
+    description: '初始化任务进度面板并返回 <agent-embed> 标签。',
     inputSchema: {
       type: 'object',
       properties: {
-        title: {
-          type: 'string',
-          description: '任务标题（可选，默认“任务进度”）',
-        },
+        title: { type: 'string', description: '任务标题' },
         tasks: {
           type: 'array',
-          description: '任务步骤列表，支持最简字符串数组（如 ["检查代码", "修改实现", "验证构建"]）或对象数组（{ id?, title, done?, status? }），默认自动按 1, 2, 3 编号并将第 1 项设为进行中。',
+          description: '步骤列表（字符串或 {id?,title,done?,status?}）',
           items: {
             oneOf: [
               { type: 'string' },
@@ -39,54 +37,31 @@ const TOOLS = [
                   id: { type: 'string' },
                   title: { type: 'string' },
                   done: { type: 'boolean' },
-                  status: {
-                    type: 'string',
-                    enum: ['pending', 'in_progress', 'completed', 'failed'],
-                  },
+                  status: { type: 'string', enum: ['pending', 'in_progress', 'completed', 'failed'] },
                 },
                 required: ['title'],
               },
             ],
           },
         },
-        log: {
-          type: 'string',
-          description: '第 1 步简短进展说明（1~2 句，关键文件名/符号/命令用反引号标出，将渲染在任务栏上方时间线中）',
-        },
-        conversation_id: {
-          type: 'string',
-          description: '可选，显式指定会话 ID；缺省自动关联当前活跃会话',
-        },
+        log: { type: 'string', description: '首步简短说明' },
+        conversation_id: { type: 'string', description: '可选会话 ID' },
       },
       required: ['tasks'],
     },
   },
   {
     name: 'task_hud_check',
-    description:
-      '更新本轮任务进度组件：完成某项任务时只需传对应 id 与 done: true（自动推进下一项为进行中）；支持仅传 log 追加上方步骤小总结、checks 批量勾选（如 {"1": true, "2": true}）或 all_done: true 一键收尾折叠。',
+    description: '更新任务进度、追加进展说明或收起面板。',
     inputSchema: {
       type: 'object',
       properties: {
-        id: {
-          type: 'string',
-          description: '要更新的任务 id、序号（如 "1"）或标题关键字',
-        },
-        done: {
-          type: 'boolean',
-          description: '完成状态：true 标为 completed（默认），false 退回 pending',
-        },
-        failed: {
-          type: 'boolean',
-          description: '传 true 将对应任务标为 failed',
-        },
-        status: {
-          type: 'string',
-          enum: ['pending', 'in_progress', 'completed', 'failed'],
-          description: '可选，显式指定状态（通常只需用 done: true）',
-        },
+        id: { type: 'string', description: '任务 id/序号/标题关键字' },
+        done: { type: 'boolean', description: 'true=completed，false=pending' },
+        failed: { type: 'boolean', description: 'true=failed' },
+        status: { type: 'string', enum: ['pending', 'in_progress', 'completed', 'failed'] },
         checks: {
-          description: '可选批量勾选，支持对象映射（如 {"1": true, "2": true}）或数组（[{ id, done }]）',
+          description: '批量更新（{"1":true} 或 [{id,done}]）',
           oneOf: [
             { type: 'object', additionalProperties: { type: 'boolean' } },
             {
@@ -97,28 +72,16 @@ const TOOLS = [
                   id: { type: 'string' },
                   done: { type: 'boolean' },
                   failed: { type: 'boolean' },
-                  status: {
-                    type: 'string',
-                    enum: ['pending', 'in_progress', 'completed', 'failed'],
-                  },
+                  status: { type: 'string', enum: ['pending', 'in_progress', 'completed', 'failed'] },
                 },
                 required: ['id'],
               },
             },
           ],
         },
-        all_done: {
-          type: 'boolean',
-          description: '传 true 一键将全部任务标为 completed 并收起面板（用于最终总结前的收尾调用）',
-        },
-        log: {
-          type: 'string',
-          description: '本步 1~2 句简练进展说明（关键项用反引号标出，将自动穿插渲染在任务栏上方）',
-        },
-        conversation_id: {
-          type: 'string',
-          description: '可选，显式指定会话 ID；缺省自动关联当前活跃会话',
-        },
+        all_done: { type: 'boolean', description: '全部完成并收起面板' },
+        log: { type: 'string', description: '本步简短进展' },
+        conversation_id: { type: 'string', description: '可选会话 ID' },
       },
     },
   },
@@ -201,16 +164,10 @@ function ensureActiveTurnAndSlot(state, now) {
 function formatProgressText(state) {
   const tasks = Array.isArray(state.tasks) ? state.tasks : [];
   const doneCount = tasks.filter((t) => t.status === 'completed').length;
-  const active = tasks.find((t) => t.status === 'in_progress');
+  if (tasks.length === 0) return '0/0';
+  if (doneCount === tasks.length) return `${doneCount}/${tasks.length} done`;
   const failedCount = tasks.filter((t) => t.status === 'failed').length;
-  if (tasks.length === 0) return '当前尚无任务。';
-  if (doneCount === tasks.length) {
-    return `全部 ${tasks.length} 项任务已完成，面板已收起。`;
-  }
-  const parts = [`进度 ${doneCount}/${tasks.length}`];
-  if (active) parts.push(`当前进行中：#${active.id} ${active.title}`);
-  if (failedCount > 0) parts.push(`失败 ${failedCount} 项`);
-  return parts.join(' · ');
+  return failedCount > 0 ? `${doneCount}/${tasks.length} (${failedCount} failed)` : `${doneCount}/${tasks.length}`;
 }
 
 function syncHudToDisk(state, hudFile, { turnFinished = false, now = Date.now() } = {}) {
@@ -297,21 +254,20 @@ function handleInitTasks(args) {
   syncHudToDisk(state, hudFile, { turnFinished: allCompleted, now });
   saveConversationState(state, dataDir);
 
-  const idMap = state.tasks.map((t) => `${t.id}: ${t.title}`).join('；');
   if (state.artifactDirectoryPath && hudFile) {
     const fileUri = `file:///${join(state.artifactDirectoryPath, hudFile).replace(/\\/g, '/')}`;
     return {
       content: [
         {
           type: 'text',
-          text: `任务组件已就绪（${formatProgressText(state)}）。任务编号：${idMap}\n请在下一步回复中原样输出以下唯一标签（标签外不写过程文字）并同时发起业务工具调用：\n<agent-embed src="${fileUri}"></agent-embed>`,
+          text: `OK ${formatProgressText(state)}\n<agent-embed src="${fileUri}"></agent-embed>`,
         },
       ],
     };
   }
 
   return {
-    content: [{ type: 'text', text: `任务清单已同步（${formatProgressText(state)}）。任务编号：${idMap}` }],
+    content: [{ type: 'text', text: `OK ${formatProgressText(state)}` }],
   };
 }
 
@@ -405,11 +361,26 @@ function handleCheckTask(args) {
   state.tasks = normalizeAndAdvanceTasks(state.tasks, { turnFinished: allCompleted, now });
 
   syncHudToDisk(state, hudFile, { turnFinished: allCompleted, now });
+
+  let endEmbedTag = '';
+  if (allCompleted && state.artifactDirectoryPath) {
+    const endFile = deriveEndHudFileName(hudFile, state.activeTurn?.turnIndex || 1);
+    if (state.activeTurn) state.activeTurn.endHudFileName = endFile;
+    const syncedEnd = syncEndHudFile(state.artifactDirectoryPath, state, {
+      turnFinished: false,
+      now,
+      targetFileName: endFile,
+    });
+    if (syncedEnd) {
+      const endUri = `file:///${join(state.artifactDirectoryPath, syncedEnd).replace(/\\/g, '/')}`;
+      endEmbedTag = `\n<agent-embed src="${endUri}"></agent-embed>`;
+    }
+  }
+
   saveConversationState(state, dataDir);
 
-  const prefix = updatedCount > 0 ? `已更新 ${updatedCount} 项任务。` : stepLog ? '已追加步骤进展。' : '';
   return {
-    content: [{ type: 'text', text: `${prefix}${formatProgressText(state)}` }],
+    content: [{ type: 'text', text: `OK ${formatProgressText(state)}${endEmbedTag}` }],
   };
 }
 
@@ -438,7 +409,7 @@ function handleRpcMessage(msg) {
         result: {
           protocolVersion,
           capabilities: { tools: { listChanged: false } },
-          serverInfo: { name: 'task-hud-tasks', version: '1.3.1' },
+          serverInfo: { name: 'task-hud-tasks', version: '1.4.0' },
         },
       });
     }
